@@ -3,6 +3,7 @@
 ;; Copyright (C) 2026 Markus Klink
 
 ;; Author: Markus Klink <justjoheinz@gmail.com>
+;; Assisted-by: claude:claude-opus-4-8
 ;; URL: https://github.com/justjoheinz/wit-ts-mode
 ;; Keywords: languages wasm wit
 ;; Version: 0.1.0
