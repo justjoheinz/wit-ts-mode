@@ -84,7 +84,10 @@ In `~/.config/doom/config.el`:
 
 ```elisp
 (use-package! wit-ts-mode
-  :mode "\\.wit\\'")
+  :mode "\\.wit\\'"
+  :config
+  ;; Optional: enable folding and outline automatically.
+  (add-hook! wit-ts-mode #'hs-minor-mode #'outline-minor-mode))
 ```
 
 Run `doom sync` afterwards.
