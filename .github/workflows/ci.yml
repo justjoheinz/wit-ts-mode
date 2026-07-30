@@ -24,7 +24,7 @@ jobs:
           version: ${{ matrix.emacs_version }}
 
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Byte-compile (warnings as errors)
         run: make compile
