@@ -50,15 +50,19 @@
   "https://github.com/bytecodealliance/tree-sitter-wit"
   "URL of the tree-sitter grammar used by `wit-ts-mode'.")
 
-;; Register the grammar source so `M-x treesit-install-language-grammar'
-;; and the on-demand install in `wit-ts-mode' both know where to find it.
-(add-to-list 'treesit-language-source-alist
-             `(wit ,wit-ts-mode-grammar-url))
+(defun wit-ts-mode--register-grammar-source ()
+  "Register the WIT grammar in `treesit-language-source-alist'.
+Done lazily (only when the mode is used) so that merely loading
+this file does not mutate that global variable."
+  (unless (assq 'wit treesit-language-source-alist)
+    (add-to-list 'treesit-language-source-alist
+                 `(wit ,wit-ts-mode-grammar-url))))
 
 (defun wit-ts-mode--ensure-grammar ()
   "Ensure the WIT tree-sitter grammar is available.
 If it is not installed, offer to install it interactively.  Signal
 an error if it remains unavailable."
+  (wit-ts-mode--register-grammar-source)
   (unless (treesit-ready-p 'wit t)
     (if (and (not noninteractive)
              (fboundp 'treesit-install-language-grammar)
