@@ -324,6 +324,39 @@ the current buffer.  Suitable for `completion-at-point-functions'."
       eos)
   "Regexp of node types treated as outline headings in `wit-ts-mode'.")
 
+;;; Navigation
+
+(defvar wit-ts-mode--defun-node-regexp
+  (rx bos (or "world_item" "interface_item" "func_item"
+              "record_item" "variant_items" "enum_items"
+              "flags_items" "resource_item" "type_item")
+      eos)
+  "Regexp of node types treated as defuns in `wit-ts-mode'.")
+
+(defvar wit-ts-mode--thing-settings
+  `((wit
+     ;; Top-level declarations, for `beginning-of-defun' etc.
+     (defun ,wit-ts-mode--defun-node-regexp)
+     ;; A sexp is any node that is not a bare delimiter, so `forward-sexp'
+     ;; and friends step over identifiers and whole constructs rather than
+     ;; individual punctuation.
+     (sexp (not ,(rx bos (or "{" "}" "(" ")" "<" ">"
+                             "," ";" ":" "." "=" "->" "@" "/")
+                     eos)))
+     ;; Bracketed groups, for `forward-list' / `up-list' / `down-list'.
+     (list ,(rx bos (or "body" "func_type" "tuple" "tuple_list"
+                        "list" "option" "result")
+                eos))
+     ;; A single declaration or member, for `forward-sentence'.
+     (sentence ,(rx bos (or "type_item" "record_field" "variant_case"
+                            "enum_case" "flags_field" "func_item"
+                            "use_item" "import_item" "export_item")
+                    eos))
+     ;; Comments and strings behave as free text.
+     (text ,(rx bos (or "line_comment" "block_comment" "string_literal")
+                eos))))
+  "Tree-sitter thing definitions for `wit-ts-mode' navigation.")
+
 ;;; Syntax checking (Flymake)
 
 (defvar-local wit-ts-mode--flymake-parser nil
@@ -446,12 +479,12 @@ protocol.  Intended for `flymake-diagnostic-functions'."
                 (operator bracket delimiter)))
 
   ;; Navigation & imenu.
-  (setq-local treesit-defun-type-regexp
-              (rx bos (or "world_item" "interface_item" "func_item"
-                          "record_item" "variant_items" "enum_items"
-                          "flags_items" "resource_item" "type_item")
-                  eos))
+  (setq-local treesit-defun-type-regexp wit-ts-mode--defun-node-regexp)
   (setq-local treesit-defun-name-function #'wit-ts-mode--defun-name)
+  ;; Structural motion: `forward-sexp', `forward-sentence', `up-list',
+  ;; `beginning-of-defun', and (via `treesit-major-mode-setup')
+  ;; `which-function-mode' all read these thing definitions.
+  (setq-local treesit-thing-settings wit-ts-mode--thing-settings)
   (setq-local treesit-simple-imenu-settings
               `(("World" "\\`world_item\\'" nil nil)
                 ("Interface" "\\`interface_item\\'" nil nil)

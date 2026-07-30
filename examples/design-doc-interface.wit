@@ -23,7 +23,7 @@ interface foo {
   }
 
   // a bitflags type
-  flags permissions {
+  flags  permissions {
     read,
     write,
     exec,

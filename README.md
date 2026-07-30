@@ -19,8 +19,12 @@ translation of that project's `queries/highlights.scm`; folding mirrors
   `wit-ts-mode-indent-offset` (default 4). Uses spaces, per WIT convention.
 - **Imenu** — worlds, interfaces, types (records, variants, enums, flags,
   resources, and type aliases), and functions.
-- **Navigation** — `treesit`-based defun movement (`C-M-a` / `C-M-e`,
-  `C-M-h`, etc.).
+- **Navigation** — tree-sitter structural motion: defun movement (`C-M-a` /
+  `C-M-e` / `C-M-h`), `forward-sexp` over identifiers and whole constructs,
+  `forward-sentence` across members, and `up-list` / `down-list` on bracketed
+  groups.
+- **Which-function** — `which-function-mode` shows the enclosing declaration
+  (e.g. `foo.errno`, `random.get-random-bytes`) in the mode line.
 - **Folding** — `hideshow` support for the brace blocks (interfaces, worlds,
   records, resources, variants, …) and block comments.
 - **Outline** — a tree-sitter–driven `outline-minor-mode` heading hierarchy
@@ -116,6 +120,24 @@ Turn folding and/or outline on automatically:
 (add-hook 'wit-ts-mode-hook #'hs-minor-mode)
 (add-hook 'wit-ts-mode-hook #'outline-minor-mode)
 ```
+
+### Navigation
+
+Motion commands operate on the parse tree, so they respect WIT structure:
+
+| Key       | Command               | Moves by                                  |
+| --------- | --------------------- | ----------------------------------------- |
+| `C-M-a`   | `beginning-of-defun`  | to the start of the enclosing declaration |
+| `C-M-e`   | `end-of-defun`        | to the end of the enclosing declaration   |
+| `C-M-f`   | `forward-sexp`        | over an identifier or a whole construct   |
+| `C-M-u`   | `backward-up-list`    | out of a `{ … }` / `< … >` / `( … )` group |
+| `C-M-d`   | `down-list`           | into the next bracketed group             |
+| `M-e`     | `forward-sentence`    | to the next member (field, case, item)    |
+
+`which-function-mode` shows the enclosing declaration in the mode line,
+including nesting — e.g. `foo.errno` for the `errno` enum inside interface
+`foo`, or `random.get-random-bytes` for a function inside interface `random`.
+In Doom it is enabled by default.
 
 ### Folding keys (`hs-minor-mode`)
 
