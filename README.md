@@ -176,16 +176,8 @@ soon as they parse. Any completion UI that reads
 `completion-at-point` — picks these up automatically; in Doom the configured
 front-end (Corfu or Company) just works.
 
-This is buffer-local completion only; it does not resolve `use`d packages or
-offer type-aware filtering. Those would require a WIT language server (see
-below).
-
-#### Language-server completion
-
-Semantic, cross-file completion (plus go-to-definition and hover) would come
-from a WIT language server via `eglot` or `lsp-mode`. No such integration is
-built in; if a suitable server becomes available it can be added without
-affecting the buffer-local completion above.
+Completion is buffer-local: it does not resolve `use`d packages or offer
+type-aware filtering.
 
 ## Highlighting notes
 
