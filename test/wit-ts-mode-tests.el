@@ -192,6 +192,28 @@ Skips the test if the WIT grammar is not ready."
     (should-not (seq-some (lambda (o) (overlay-get o 'hs))
                           (overlays-in (point-min) (point-max))))))
 
+;;; Outline
+
+(ert-deftest wit-ts-mode-outline-only-multiline-headings ()
+  "Multi-line declarations are outline headings; single-line ones are not."
+  (wit-ts-mode-tests--with-file "sample.wit"
+    (let ((heading-types
+           (let (types)
+             (treesit-search-subtree
+              (treesit-buffer-root-node)
+              (lambda (node)
+                (when (wit-ts-mode--outline-predicate node)
+                  (push (treesit-node-type node) types))
+                nil)
+              nil t)
+             types)))
+      ;; Multi-line block declarations qualify.
+      (should (member "interface_item" heading-types))
+      (should (member "record_item" heading-types))
+      (should (member "enum_items" heading-types))
+      ;; Single-line declarations do not get a heading marker.
+      (should-not (member "type_item" heading-types)))))
+
 ;;; Completion
 
 (ert-deftest wit-ts-mode-completion-includes-keywords-and-defs ()

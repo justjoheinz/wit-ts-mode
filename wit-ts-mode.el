@@ -331,13 +331,23 @@ the current buffer.  Suitable for `completion-at-point-functions'."
 ;;; Outline
 
 (defvar wit-ts-mode--outline-node-regexp
-  (rx bos (or "package_decl"
-              "world_item" "interface_item"
-              "func_item" "type_item" "record_item"
-              "variant_items" "enum_items" "flags_items" "resource_item"
-              "import_item" "export_item" "toplevel_use_item")
+  (rx bos (or "world_item" "interface_item"
+              "func_item" "record_item"
+              "variant_items" "enum_items" "flags_items" "resource_item")
       eos)
-  "Regexp of node types treated as outline headings in `wit-ts-mode'.")
+  "Regexp of node types that may act as outline headings in `wit-ts-mode'.
+A node is only treated as a heading when it also spans multiple
+lines; see `wit-ts-mode--outline-predicate'.")
+
+(defun wit-ts-mode--outline-predicate (node)
+  "Return non-nil if NODE should be an outline heading.
+Only multi-line declarations qualify, so single-line items (such
+as `type t = u32;' or a one-line function) do not get a fold
+marker with nothing to hide."
+  (and (string-match-p wit-ts-mode--outline-node-regexp
+                       (treesit-node-type node))
+       (> (line-number-at-pos (treesit-node-end node))
+          (line-number-at-pos (treesit-node-start node)))))
 
 ;;; Navigation
 
@@ -511,7 +521,7 @@ protocol.  Intended for `flymake-diagnostic-functions'."
 
   ;; Folding: hideshow reads the `hs-special-modes-alist' entry above; a
   ;; tree-sitter-driven outline covers the declaration hierarchy.
-  (setq-local treesit-outline-predicate wit-ts-mode--outline-node-regexp)
+  (setq-local treesit-outline-predicate #'wit-ts-mode--outline-predicate)
 
   ;; Syntax checking: report tree-sitter parse errors through Flymake.
   ;; Enable `flymake-mode' to see them.
