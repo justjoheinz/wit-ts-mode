@@ -1,0 +1,10 @@
+# Byte-compiled / native-compiled Emacs Lisp
+*.elc
+*.eln
+/eln-cache/
+
+# Package / test artifacts
+/.elpa/
+/dist/
+*-autoloads.el
+*-pkg.el
