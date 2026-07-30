@@ -6,7 +6,7 @@
 ;; URL: https://github.com/justjoheinz/wit-ts-mode
 ;; Keywords: languages wasm wit
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: Apache-2.0
 
 ;; Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -16,7 +16,7 @@
 ;;; Commentary:
 
 ;; A major mode for editing WIT (WebAssembly Interface Types) files, built on
-;; the built-in tree-sitter support (`treesit', Emacs 29.1+).
+;; the built-in tree-sitter support (`treesit', Emacs 30.1+).
 ;;
 ;; It uses the `wit' tree-sitter grammar from
 ;; https://github.com/bytecodealliance/tree-sitter-wit and mirrors the
@@ -39,6 +39,7 @@
 (require 'treesit)
 (require 'hideshow)
 (require 'flymake)
+(require 'seq)
 
 (declare-function treesit-parser-create "treesit.c")
 (declare-function treesit-node-type "treesit.c")
@@ -50,10 +51,20 @@
 (declare-function treesit-search-subtree "treesit.c")
 (declare-function treesit-parser-root-node "treesit.c")
 (declare-function treesit-parser-list "treesit.c")
+(declare-function treesit-parser-language "treesit.c")
 (declare-function treesit-node-at "treesit.c")
 (declare-function treesit-node-parent "treesit.c")
 (declare-function treesit-node-text "treesit.c")
 (declare-function treesit-query-capture "treesit.c")
+
+(defun wit-ts-mode--parser ()
+  "Return the buffer's `wit' tree-sitter parser, or nil.
+Filters `treesit-parser-list' by language in Emacs Lisp rather
+than passing a language argument, which is unsupported before
+Emacs 30."
+  (seq-find (lambda (parser)
+              (eq (treesit-parser-language parser) 'wit))
+            (treesit-parser-list)))
 
 ;;; Grammar
 
@@ -260,7 +271,7 @@ Most WIT declarations store their name in the `name' field; a
   "Return a list of identifier names defined in the current buffer.
 Collected from the tree-sitter parse tree (interfaces, worlds, and
 the various type and function definitions)."
-  (when-let* ((parser (car (treesit-parser-list nil 'wit))))
+  (when-let* ((parser (wit-ts-mode--parser)))
     (delete-dups
      (mapcar (lambda (node) (treesit-node-text node t))
              (treesit-query-capture
@@ -444,7 +455,7 @@ often an anonymous node."
 REPORT-FN is called with the diagnostics, per the Flymake backend
 protocol.  Intended for `flymake-diagnostic-functions'."
   (if-let* ((parser (or wit-ts-mode--flymake-parser
-                        (car (treesit-parser-list nil 'wit)))))
+                        (wit-ts-mode--parser))))
       (funcall report-fn
                (wit-ts-mode--flymake-diagnostics parser (current-buffer)))
     (funcall report-fn nil)))

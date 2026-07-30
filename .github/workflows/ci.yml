@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs_version:
+          - "30.1"
+          - "30.2"
+          - snapshot
+
+    steps:
+      - name: Set up Emacs
+        uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs_version }}
+
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Byte-compile (warnings as errors)
+        run: make compile
+
+      - name: Checkdoc
+        run: make checkdoc
+
+      - name: package-lint
+        run: make lint
+
+      - name: Install the WIT tree-sitter grammar
+        run: make grammar
+
+      - name: Run ERT tests
+        run: make test

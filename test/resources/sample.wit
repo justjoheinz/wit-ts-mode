@@ -1,0 +1,28 @@
+package example:sample@1.0.0;
+
+interface things {
+  record point {
+    x: u32,
+    y: u32,
+  }
+
+  enum color {
+    red,
+    green,
+    blue,
+  }
+
+  variant shape {
+    circle(u32),
+    rectangle(point),
+  }
+
+  type coord = u64;
+
+  distance: func(a: point, b: point) -> f64;
+}
+
+world app {
+  import things;
+  export things;
+}

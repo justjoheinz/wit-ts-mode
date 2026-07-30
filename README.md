@@ -1,10 +1,12 @@
 # wit-ts-mode
 
+[![CI](https://github.com/justjoheinz/wit-ts-mode/actions/workflows/ci.yml/badge.svg)](https://github.com/justjoheinz/wit-ts-mode/actions/workflows/ci.yml)
+
 A tree-sitter–based Emacs major mode for [WIT][wit] (WebAssembly Interface
 Types) files, the interface-definition language used by the WebAssembly
 Component Model.
 
-It is built on Emacs's built-in tree-sitter support (`treesit`, Emacs 29.1+)
+It is built on Emacs's built-in tree-sitter support (`treesit`, Emacs 30.1+)
 and the [`tree-sitter-wit`][grammar] grammar. Highlighting is a faithful
 translation of that project's `queries/highlights.scm`; folding mirrors
 `queries/folds.scm`.
@@ -36,8 +38,10 @@ translation of that project's `queries/highlights.scm`; folding mirrors
 
 ## Requirements
 
-- Emacs 29.1 or newer, built with tree-sitter support
-  (`(treesit-available-p)` returns `t`).
+- Emacs 30.1 or newer, built with tree-sitter support
+  (`(treesit-available-p)` returns `t`). Emacs 30.1 is required for the
+  outline and structural-navigation features (`treesit-thing-settings` and
+  `treesit-outline-predicate` are new in 30.1).
 - The `wit` tree-sitter grammar installed and loadable
   (`(treesit-ready-p 'wit)` returns `t`).
 
@@ -220,6 +224,25 @@ The `examples/` directory holds the sample `.wit` files from the grammar
 repository. Open any of them to exercise highlighting, indentation, imenu,
 folding, and outline. All five parse with zero errors and round-trip through
 `indent-region` unchanged (at their native indent width).
+
+An ERT suite lives in `test/`, with fixtures under `test/resources/`. It
+covers font-lock faces, indentation, imenu, navigation and which-function,
+Flymake diagnostics, and completion. Every test skips itself (rather than
+failing) when the grammar is unavailable, so it is safe to run anywhere.
+
+Common tasks are wrapped in a `Makefile`:
+
+```sh
+make grammar   # install the WIT tree-sitter grammar (needs a C compiler)
+make test      # run the ERT suite
+make compile   # byte-compile with warnings as errors
+make checkdoc  # run checkdoc
+make lint      # run package-lint
+make all       # compile + checkdoc + test
+```
+
+CI runs `compile`, `checkdoc`, `lint`, and `test` on every push across a
+matrix of Emacs versions (see `.github/workflows/ci.yml`).
 
 ## License
 

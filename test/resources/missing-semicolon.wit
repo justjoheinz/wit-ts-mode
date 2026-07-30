@@ -1,0 +1,6 @@
+package local:demo;
+
+interface foo {
+    type t = u32
+    type u = s32;
+}
