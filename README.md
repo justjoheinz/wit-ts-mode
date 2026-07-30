@@ -137,11 +137,13 @@ regexps.
 ### Syntax checking (`flymake-mode`)
 
 The mode registers a Flymake backend, so `M-x flymake-mode` highlights parse
-errors as you type. Two kinds are reported:
+errors as you type. Two kinds are reported, each with a descriptive message:
 
-- **unexpected input** — a token the grammar can't place (e.g. a stray `=`);
-- **missing token** — something required is absent, such as the closing brace
-  of an unterminated block.
+- **unexpected input** — offending text the grammar can't place, quoted in
+  the message (e.g. `Syntax error: unexpected `type = u32;'`);
+- **expected token** — something required is absent; the message names it
+  (e.g. `Syntax error: expected semicolon `;'` or `expected closing brace
+  `}'` for an unterminated block).
 
 Jump between them with `M-x flymake-goto-next-error` /
 `flymake-goto-prev-error`, or list them with `M-x

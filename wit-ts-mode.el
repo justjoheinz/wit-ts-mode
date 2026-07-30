@@ -329,6 +329,48 @@ the current buffer.  Suitable for `completion-at-point-functions'."
 (defvar-local wit-ts-mode--flymake-parser nil
   "Tree-sitter parser used by the Flymake backend, if any.")
 
+(defconst wit-ts-mode--token-descriptions
+  '(("}" . "closing brace `}'")
+    ("{" . "opening brace `{'")
+    (")" . "closing parenthesis `)'")
+    ("(" . "opening parenthesis `('")
+    (">" . "closing angle bracket `>'")
+    ("<" . "opening angle bracket `<'")
+    (";" . "semicolon `;'")
+    ("," . "comma `,'")
+    (":" . "colon `:'")
+    ("=" . "`='")
+    ("->" . "arrow `->'"))
+  "Human-readable descriptions for tokens that may be reported missing.")
+
+(defun wit-ts-mode--describe-token (type)
+  "Return a human-readable description of tree-sitter node TYPE."
+  (or (cdr (assoc type wit-ts-mode--token-descriptions))
+      (format "`%s'" type)))
+
+(defun wit-ts-mode--snippet (node)
+  "Return a short single-line snippet of NODE's text for a message."
+  (let* ((text (treesit-node-text node t))
+         ;; Collapse whitespace/newlines so the message stays one line.
+         (flat (string-trim (replace-regexp-in-string "[ \t\n]+" " " text))))
+    (if (> (length flat) 30)
+        (concat (substring flat 0 30) "…")
+      flat)))
+
+(defun wit-ts-mode--missing-message (node)
+  "Return a Flymake message describing missing-token NODE."
+  (format "Syntax error: expected %s"
+          (wit-ts-mode--describe-token (treesit-node-type node))))
+
+(defun wit-ts-mode--error-message (node)
+  "Return a Flymake message describing ERROR NODE.
+When the offending text is short, quote it; otherwise fall back to
+a generic message."
+  (let ((snippet (wit-ts-mode--snippet node)))
+    (if (string-empty-p snippet)
+        "Syntax error: unexpected input"
+      (format "Syntax error: unexpected `%s'" snippet))))
+
 (defun wit-ts-mode--flymake-diag (source node message)
   "Make a Flymake error diagnostic for NODE in SOURCE with MESSAGE.
 Zero-width nodes are widened by one character so there is
@@ -339,10 +381,11 @@ something to underline."
 
 (defun wit-ts-mode--flymake-diagnostics (parser source)
   "Return Flymake diagnostics for parse errors in PARSER.
-Anchor them in the SOURCE buffer.  Both `ERROR' nodes (unexpected
-input) and missing nodes (e.g. the closing brace of an
-unterminated block) are reported.  The traversal visits anonymous
-nodes too, since a missing token is often an anonymous node."
+Anchor them in the SOURCE buffer.  Missing nodes report the token
+the grammar expected (a missing node's type is that token, e.g.
+`}' or `;'); `ERROR' nodes quote the offending input.  The
+traversal visits anonymous nodes too, since a missing token is
+often an anonymous node."
   (let (diags)
     (treesit-search-subtree
      (treesit-parser-root-node parser)
@@ -350,11 +393,11 @@ nodes too, since a missing token is often an anonymous node."
        (cond
         ((treesit-node-check node 'missing)
          (push (wit-ts-mode--flymake-diag
-                source node "Syntax error: missing token")
+                source node (wit-ts-mode--missing-message node))
                diags))
         ((equal (treesit-node-type node) "ERROR")
          (push (wit-ts-mode--flymake-diag
-                source node "Syntax error: unexpected input")
+                source node (wit-ts-mode--error-message node))
                diags)))
        ;; Return nil so the walk visits every node.
        nil)
