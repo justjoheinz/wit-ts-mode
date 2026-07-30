@@ -27,6 +27,8 @@ translation of that project's `queries/highlights.scm`; folding mirrors
   (package → world/interface → members) for structural navigation.
 - **Syntax checking** — a Flymake backend that surfaces tree-sitter parse
   errors (unexpected input and missing tokens such as an unclosed brace).
+- **Completion** — a `completion-at-point` function offering WIT keywords,
+  builtin types, and identifiers defined in the current buffer.
 
 ## Requirements
 
@@ -155,6 +157,35 @@ To turn it on for every WIT buffer:
 For a one-off look at *where* a file diverges from the grammar without any
 extra setup, `M-x treesit-explore-mode` shows the live parse tree with
 `ERROR` / `MISSING` nodes marked.
+
+### Completion
+
+The mode adds a `completion-at-point` function, so `M-x completion-at-point`
+(often bound to `C-M-i` / `TAB`) completes:
+
+- **keywords** — `interface`, `world`, `record`, `func`, `resource`, …;
+- **builtin types** — `u8`…`u64`, `string`, `list`, `option`, `result`, …;
+- **buffer definitions** — the names of interfaces, worlds, records,
+  variants, enums, flags, resources, type aliases, and functions defined in
+  the current file.
+
+Completion is suppressed inside comments and string literals. Candidates are
+gathered from the parse tree, so newly typed definitions become available as
+soon as they parse. Any completion UI that reads
+`completion-at-point-functions` — Corfu, Company, or the built-in
+`completion-at-point` — picks these up automatically; in Doom the configured
+front-end (Corfu or Company) just works.
+
+This is buffer-local completion only; it does not resolve `use`d packages or
+offer type-aware filtering. Those would require a WIT language server (see
+below).
+
+#### Language-server completion
+
+Semantic, cross-file completion (plus go-to-definition and hover) would come
+from a WIT language server via `eglot` or `lsp-mode`. No such integration is
+built in; if a suitable server becomes available it can be added without
+affecting the buffer-local completion above.
 
 ## Highlighting notes
 

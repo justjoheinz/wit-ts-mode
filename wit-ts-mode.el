@@ -50,6 +50,10 @@
 (declare-function treesit-search-subtree "treesit.c")
 (declare-function treesit-parser-root-node "treesit.c")
 (declare-function treesit-parser-list "treesit.c")
+(declare-function treesit-node-at "treesit.c")
+(declare-function treesit-node-parent "treesit.c")
+(declare-function treesit-node-text "treesit.c")
+(declare-function treesit-query-capture "treesit.c")
 
 ;;; Grammar
 
@@ -226,6 +230,76 @@ Most WIT declarations store their name in the `name' field; a
     (when name
       (treesit-node-text name t))))
 
+;;; Completion
+
+(defconst wit-ts-mode--keywords
+  '("type" "interface" "world" "package" "resource" "record" "enum"
+    "flags" "variant" "func" "static" "async" "constructor"
+    "include" "import" "export" "use" "as" "with")
+  "WIT keywords offered for completion.")
+
+(defconst wit-ts-mode--builtin-types
+  '("u8" "u16" "u32" "u64" "s8" "s16" "s32" "s64" "f32" "f64"
+    "char" "bool" "string"
+    "tuple" "list" "option" "result" "map" "borrow" "future" "stream")
+  "WIT builtin and predefined type constructors offered for completion.")
+
+(defconst wit-ts-mode--completion-defs-query
+  '((interface_item name: (id) @n)
+    (world_item name: (id) @n)
+    (record_item name: (id) @n)
+    (variant_items name: (id) @n)
+    (enum_items name: (id) @n)
+    (flags_items name: (id) @n)
+    (resource_item name: (id) @n)
+    (type_item alias: (id) @n)
+    (func_item name: (id) @n))
+  "Tree-sitter query capturing names of top-level WIT definitions.")
+
+(defun wit-ts-mode--buffer-definitions ()
+  "Return a list of identifier names defined in the current buffer.
+Collected from the tree-sitter parse tree (interfaces, worlds, and
+the various type and function definitions)."
+  (when-let* ((parser (car (treesit-parser-list nil 'wit))))
+    (delete-dups
+     (mapcar (lambda (node) (treesit-node-text node t))
+             (treesit-query-capture
+              (treesit-parser-root-node parser)
+              wit-ts-mode--completion-defs-query nil nil t)))))
+
+(defun wit-ts-mode--completion-candidates ()
+  "Return all completion candidates: keywords, builtins, definitions."
+  (append wit-ts-mode--keywords
+          wit-ts-mode--builtin-types
+          (wit-ts-mode--buffer-definitions)))
+
+(defun wit-ts-mode--in-comment-or-string-p (node)
+  "Return non-nil if NODE is, or is inside, a comment or string."
+  (let ((types '("line_comment" "block_comment" "doc_comment"
+                 "string_literal"))
+        (cur node)
+        found)
+    (while (and cur (not found))
+      (when (member (treesit-node-type cur) types)
+        (setq found t))
+      (setq cur (treesit-node-parent cur)))
+    found))
+
+(defun wit-ts-mode-completion-at-point ()
+  "Completion-at-point function for `wit-ts-mode'.
+Completes WIT keywords, builtin types, and identifiers defined in
+the current buffer.  Suitable for `completion-at-point-functions'."
+  (let ((node (treesit-node-at (point))))
+    ;; Do not complete inside comments or string literals.
+    (unless (wit-ts-mode--in-comment-or-string-p node)
+      (let* ((bounds (bounds-of-thing-at-point 'symbol))
+             (start (if bounds (car bounds) (point)))
+             (end (if bounds (cdr bounds) (point))))
+        (list start end
+              (completion-table-dynamic
+               (lambda (_prefix) (wit-ts-mode--completion-candidates)))
+              :exclusive 'no)))))
+
 ;;; Folding
 
 ;; Translation of queries/folds.scm.  The grammar folds on `(body)' nodes
@@ -352,6 +426,10 @@ protocol.  Intended for `flymake-diagnostic-functions'."
   ;; Syntax checking: report tree-sitter parse errors through Flymake.
   ;; Enable `flymake-mode' to see them.
   (add-hook 'flymake-diagnostic-functions #'wit-ts-mode-flymake nil t)
+
+  ;; Completion: keywords, builtin types, and buffer-local definitions.
+  (add-hook 'completion-at-point-functions
+            #'wit-ts-mode-completion-at-point nil t)
 
   (treesit-major-mode-setup))
 
