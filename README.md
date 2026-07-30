@@ -25,6 +25,8 @@ translation of that project's `queries/highlights.scm`; folding mirrors
   records, resources, variants, …) and block comments.
 - **Outline** — a tree-sitter–driven `outline-minor-mode` heading hierarchy
   (package → world/interface → members) for structural navigation.
+- **Syntax checking** — a Flymake backend that surfaces tree-sitter parse
+  errors (unexpected input and missing tokens such as an unclosed brace).
 
 ## Requirements
 
@@ -129,6 +131,30 @@ Turn folding and/or outline on automatically:
 top-level headings. Headings are the package declaration and each
 world/interface plus their members — derived from the parse tree, not
 regexps.
+
+### Syntax checking (`flymake-mode`)
+
+The mode registers a Flymake backend, so `M-x flymake-mode` highlights parse
+errors as you type. Two kinds are reported:
+
+- **unexpected input** — a token the grammar can't place (e.g. a stray `=`);
+- **missing token** — something required is absent, such as the closing brace
+  of an unterminated block.
+
+Jump between them with `M-x flymake-goto-next-error` /
+`flymake-goto-prev-error`, or list them with `M-x
+flymake-show-buffer-diagnostics`. In Doom, Flymake is enabled automatically
+for `prog-mode` derivatives, so this works out of the box.
+
+To turn it on for every WIT buffer:
+
+```elisp
+(add-hook 'wit-ts-mode-hook #'flymake-mode)
+```
+
+For a one-off look at *where* a file diverges from the grammar without any
+extra setup, `M-x treesit-explore-mode` shows the live parse tree with
+`ERROR` / `MISSING` nodes marked.
 
 ## Highlighting notes
 

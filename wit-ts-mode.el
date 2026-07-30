@@ -38,11 +38,18 @@
 
 (require 'treesit)
 (require 'hideshow)
+(require 'flymake)
 
 (declare-function treesit-parser-create "treesit.c")
 (declare-function treesit-node-type "treesit.c")
 (declare-function treesit-node-child "treesit.c")
 (declare-function treesit-node-child-by-field-name "treesit.c")
+(declare-function treesit-node-start "treesit.c")
+(declare-function treesit-node-end "treesit.c")
+(declare-function treesit-node-check "treesit.c")
+(declare-function treesit-search-subtree "treesit.c")
+(declare-function treesit-parser-root-node "treesit.c")
+(declare-function treesit-parser-list "treesit.c")
 
 ;;; Grammar
 
@@ -243,6 +250,55 @@ Most WIT declarations store their name in the `name' field; a
       eos)
   "Regexp of node types treated as outline headings in `wit-ts-mode'.")
 
+;;; Syntax checking (Flymake)
+
+(defvar-local wit-ts-mode--flymake-parser nil
+  "Tree-sitter parser used by the Flymake backend, if any.")
+
+(defun wit-ts-mode--flymake-diag (source node message)
+  "Make a Flymake error diagnostic for NODE in SOURCE with MESSAGE.
+Zero-width nodes are widened by one character so there is
+something to underline."
+  (let* ((beg (treesit-node-start node))
+         (end (max (treesit-node-end node) (1+ beg))))
+    (flymake-make-diagnostic source beg end :error message)))
+
+(defun wit-ts-mode--flymake-diagnostics (parser source)
+  "Return Flymake diagnostics for parse errors in PARSER.
+Anchor them in the SOURCE buffer.  Both `ERROR' nodes (unexpected
+input) and missing nodes (e.g. the closing brace of an
+unterminated block) are reported.  The traversal visits anonymous
+nodes too, since a missing token is often an anonymous node."
+  (let (diags)
+    (treesit-search-subtree
+     (treesit-parser-root-node parser)
+     (lambda (node)
+       (cond
+        ((treesit-node-check node 'missing)
+         (push (wit-ts-mode--flymake-diag
+                source node "Syntax error: missing token")
+               diags))
+        ((equal (treesit-node-type node) "ERROR")
+         (push (wit-ts-mode--flymake-diag
+                source node "Syntax error: unexpected input")
+               diags)))
+       ;; Return nil so the walk visits every node.
+       nil)
+     nil
+     ;; ALL: include anonymous nodes so missing tokens are seen.
+     t)
+    (nreverse diags)))
+
+(defun wit-ts-mode-flymake (report-fn &rest _args)
+  "A Flymake backend reporting WIT tree-sitter parse errors.
+REPORT-FN is called with the diagnostics, per the Flymake backend
+protocol.  Intended for `flymake-diagnostic-functions'."
+  (if-let* ((parser (or wit-ts-mode--flymake-parser
+                        (car (treesit-parser-list nil 'wit)))))
+      (funcall report-fn
+               (wit-ts-mode--flymake-diagnostics parser (current-buffer)))
+    (funcall report-fn nil)))
+
 ;;; Mode definition
 
 ;;;###autoload
@@ -251,7 +307,7 @@ Most WIT declarations store their name in the `name' field; a
   :group 'wit-ts
   (wit-ts-mode--ensure-grammar)
 
-  (treesit-parser-create 'wit)
+  (setq wit-ts-mode--flymake-parser (treesit-parser-create 'wit))
 
   ;; Comments.
   (setq-local comment-start "// ")
@@ -292,6 +348,10 @@ Most WIT declarations store their name in the `name' field; a
   ;; entry registered in `hs-special-modes-alist', and a
   ;; tree-sitter-driven outline over the declaration hierarchy.
   (setq-local treesit-outline-predicate wit-ts-mode--outline-node-regexp)
+
+  ;; Syntax checking: report tree-sitter parse errors through Flymake.
+  ;; Enable `flymake-mode' to see them.
+  (add-hook 'flymake-diagnostic-functions #'wit-ts-mode-flymake nil t)
 
   (treesit-major-mode-setup))
 
