@@ -194,25 +194,27 @@ Skips the test if the WIT grammar is not ready."
 
 ;;; Outline
 
-(ert-deftest wit-ts-mode-outline-only-multiline-headings ()
-  "Multi-line declarations are outline headings; single-line ones are not."
-  (wit-ts-mode-tests--with-file "sample.wit"
-    (let ((heading-types
-           (let (types)
-             (treesit-search-subtree
-              (treesit-buffer-root-node)
-              (lambda (node)
-                (when (wit-ts-mode--outline-predicate node)
-                  (push (treesit-node-type node) types))
-                nil)
-              nil t)
-             types)))
-      ;; Multi-line block declarations qualify.
-      (should (member "interface_item" heading-types))
-      (should (member "record_item" heading-types))
-      (should (member "enum_items" heading-types))
-      ;; Single-line declarations do not get a heading marker.
-      (should-not (member "type_item" heading-types)))))
+(ert-deftest wit-ts-mode-outline-fold-does-not-swallow-siblings ()
+  "Collapsing a block hides only its own body, not later declarations.
+Regression test: a `flags' block must not swallow the `type'
+declarations that follow it."
+  (skip-unless (treesit-ready-p 'wit t))
+  (require 'outline)
+  (with-temp-buffer
+    (insert "interface foo {\n"
+            "  flags perm {\n    read,\n    write,\n  }\n"
+            "  type after = u32;\n"
+            "}\n")
+    (wit-ts-mode)
+    (outline-minor-mode 1)
+    (goto-char (point-min))
+    (search-forward "flags perm")
+    (beginning-of-line)
+    (outline-hide-subtree)
+    ;; The line declaring `type after' must remain visible.
+    (goto-char (point-min))
+    (search-forward "type after")
+    (should-not (get-char-property (line-beginning-position) 'invisible))))
 
 ;;; Completion
 
