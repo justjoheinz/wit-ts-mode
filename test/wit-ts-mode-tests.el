@@ -174,6 +174,24 @@ Skips the test if the WIT grammar is not ready."
                                  (flymake-diagnostic-text d)))
                diags)))))
 
+;;; Folding
+
+(ert-deftest wit-ts-mode-hideshow-folds-blocks ()
+  "`hs-minor-mode' can hide and show brace blocks."
+  (wit-ts-mode-tests--with-file "sample.wit"
+    (hs-minor-mode 1)
+    (goto-char (point-min))
+    ;; Position on the opening brace of the interface, then hide it.
+    (search-forward "interface things {")
+    (backward-char 1)
+    (hs-hide-block)
+    (should (seq-some (lambda (o) (overlay-get o 'hs))
+                      (overlays-in (point-min) (point-max))))
+    ;; Showing all removes the folding overlays.
+    (hs-show-all)
+    (should-not (seq-some (lambda (o) (overlay-get o 'hs))
+                          (overlays-in (point-min) (point-max))))))
+
 ;;; Completion
 
 (ert-deftest wit-ts-mode-completion-includes-keywords-and-defs ()

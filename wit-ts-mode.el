@@ -315,14 +315,18 @@ the current buffer.  Suitable for `completion-at-point-functions'."
 
 ;; Translation of queries/folds.scm.  The grammar folds on `(body)' nodes
 ;; (the braced blocks of worlds, interfaces, records, resources, variants,
-;; ...) and on block comments.  hideshow works on the brace structure
-;; directly, so registering the block delimiters reproduces those folds.
+;; ...) and on block comments.  hideshow drives this from its per-mode
+;; entry in `hs-special-modes-alist'.  That variable is obsolete as of
+;; Emacs 31.1 but still honoured (and is the only cross-version way to
+;; configure block *and* comment folding, since `hs-minor-mode' otherwise
+;; overwrites the buffer-local parameters), so the warning is suppressed.
 (defvar wit-ts-mode--hideshow-spec
   '(wit-ts-mode "{" "}" "/[*/]" nil nil)
-  "Entry for `hs-special-modes-alist' describing WIT block folds.")
+  "Entry describing WIT block folds for hideshow.")
 
-(unless (assq 'wit-ts-mode hs-special-modes-alist)
-  (add-to-list 'hs-special-modes-alist wit-ts-mode--hideshow-spec))
+(with-suppressed-warnings ((obsolete hs-special-modes-alist))
+  (unless (assq 'wit-ts-mode hs-special-modes-alist)
+    (add-to-list 'hs-special-modes-alist wit-ts-mode--hideshow-spec)))
 
 ;;; Outline
 
@@ -505,9 +509,8 @@ protocol.  Intended for `flymake-diagnostic-functions'."
                  nil nil)
                 ("Function" "\\`func_item\\'" nil nil)))
 
-  ;; Folding: hideshow on the brace blocks (queries/folds.scm) via the
-  ;; entry registered in `hs-special-modes-alist', and a
-  ;; tree-sitter-driven outline over the declaration hierarchy.
+  ;; Folding: hideshow reads the `hs-special-modes-alist' entry above; a
+  ;; tree-sitter-driven outline covers the declaration hierarchy.
   (setq-local treesit-outline-predicate wit-ts-mode--outline-node-regexp)
 
   ;; Syntax checking: report tree-sitter parse errors through Flymake.
