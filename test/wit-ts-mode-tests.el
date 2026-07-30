@@ -216,6 +216,34 @@ declarations that follow it."
     (search-forward "type after")
     (should-not (get-char-property (line-beginning-position) 'invisible))))
 
+(ert-deftest wit-ts-mode-outline-single-line-item-is-heading ()
+  "A single-line declaration is recognized as its own outline heading.
+Regression test: `outline-on-heading-p' must agree with the
+display, otherwise folding a single-line item hides the line
+above it."
+  (skip-unless (treesit-ready-p 'wit t))
+  (require 'outline)
+  (with-temp-buffer
+    (insert "interface foo {\n"
+            "  type a = u32;\n"
+            "  type b = u64;\n"
+            "}\n")
+    (wit-ts-mode)
+    (outline-minor-mode 1)
+    (goto-char (point-min))
+    (search-forward "type b")
+    (beginning-of-line)
+    (should (outline-on-heading-p))
+    ;; Collapsing a leaf item hides nothing (no line above it folds).
+    (let ((line-a (progn (goto-char (point-min))
+                         (search-forward "type a")
+                         (line-beginning-position))))
+      (goto-char (point-min))
+      (search-forward "type b")
+      (beginning-of-line)
+      (outline-hide-subtree)
+      (should-not (get-char-property line-a 'invisible)))))
+
 ;;; Completion
 
 (ert-deftest wit-ts-mode-completion-includes-keywords-and-defs ()

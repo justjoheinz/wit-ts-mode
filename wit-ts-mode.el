@@ -39,6 +39,7 @@
 (require 'treesit)
 (require 'hideshow)
 (require 'flymake)
+(require 'outline)
 (require 'seq)
 
 (declare-function treesit-parser-create "treesit.c")
@@ -344,6 +345,82 @@ bound the *preceding* multi-line block correctly.  Marking only
 multi-line nodes would make a fold like `flags { ... }' swallow
 every declaration after it, up to the next multi-line heading.")
 
+;; `wit-ts-mode' uses a custom `outline-search-function' rather than the
+;; built-in `treesit-outline-predicate'.  The built-in anchors headings by
+;; testing whether a heading node covers the beginning or end of the line,
+;; but WIT declarations are indented and single-line items end exactly at
+;; end-of-line, so neither position falls inside the node's half-open span.
+;; The result is that single-line items (`type t = u32;') are reported as
+;; headings for display yet fail `outline-on-heading-p', so folding operates
+;; on the wrong subtree (collapsing them hides the line above, and
+;; collapsing a block swallows the items after it).  Anchoring on the node's
+;; own start line instead fixes both.
+
+(defun wit-ts-mode--outline-heading-on-line-p ()
+  "Return non-nil if an outline heading node begins on the current line."
+  (save-excursion
+    (let* ((bol (line-beginning-position))
+           (eol (line-end-position))
+           (node (treesit-node-at
+                  (save-excursion (back-to-indentation) (point)))))
+      (while (and node
+                  (>= (treesit-node-start node) bol)
+                  (not (string-match-p wit-ts-mode--outline-node-regexp
+                                       (treesit-node-type node))))
+        (setq node (treesit-node-parent node)))
+      (and node
+           (string-match-p wit-ts-mode--outline-node-regexp
+                           (treesit-node-type node))
+           (<= bol (treesit-node-start node))
+           (< (treesit-node-start node) eol)))))
+
+(defun wit-ts-mode--outline-level ()
+  "Return the outline nesting level of the heading on the current line.
+Derived from the depth of the heading node in the syntax tree so
+that members nest one level below their enclosing world or
+interface."
+  (let ((node (treesit-node-at
+               (save-excursion (back-to-indentation) (point))))
+        (level 1))
+    ;; Ascend to the heading node itself.
+    (while (and node
+                (not (string-match-p wit-ts-mode--outline-node-regexp
+                                     (treesit-node-type node))))
+      (setq node (treesit-node-parent node)))
+    ;; Count enclosing heading nodes above it.
+    (when node
+      (let ((parent (treesit-node-parent node)))
+        (while parent
+          (when (string-match-p wit-ts-mode--outline-node-regexp
+                                (treesit-node-type parent))
+            (setq level (1+ level)))
+          (setq parent (treesit-node-parent parent)))))
+    level))
+
+(defun wit-ts-mode--outline-search (&optional bound move backward looking-at)
+  "Search for the next WIT outline heading via the syntax tree.
+For BOUND, MOVE, BACKWARD, and LOOKING-AT see `outline-search-function'."
+  (if looking-at
+      (wit-ts-mode--outline-heading-on-line-p)
+    (let ((step (if backward -1 1))
+          (found nil))
+      (save-excursion
+        (catch 'done
+          (while (if backward (not (bobp)) (not (eobp)))
+            (forward-line step)
+            (when (and bound (if backward (< (point) bound) (> (point) bound)))
+              (throw 'done nil))
+            (when (wit-ts-mode--outline-heading-on-line-p)
+              (setq found (line-beginning-position))
+              (throw 'done t)))))
+      (if found
+          (progn (goto-char found)
+                 (set-match-data (list (point) (line-end-position)))
+                 t)
+        (when move
+          (goto-char (or bound (if backward (point-min) (point-max)))))
+        nil))))
+
 ;;; Navigation
 
 (defvar wit-ts-mode--defun-node-regexp
@@ -515,8 +592,10 @@ protocol.  Intended for `flymake-diagnostic-functions'."
                 ("Function" "\\`func_item\\'" nil nil)))
 
   ;; Folding: hideshow reads the `hs-special-modes-alist' entry above; a
-  ;; tree-sitter-driven outline covers the declaration hierarchy.
-  (setq-local treesit-outline-predicate wit-ts-mode--outline-node-regexp)
+  ;; tree-sitter-driven outline covers the declaration hierarchy, via a
+  ;; custom search function (see `wit-ts-mode--outline-search').
+  (setq-local outline-search-function #'wit-ts-mode--outline-search)
+  (setq-local outline-level #'wit-ts-mode--outline-level)
 
   ;; Syntax checking: report tree-sitter parse errors through Flymake.
   ;; Enable `flymake-mode' to see them.
