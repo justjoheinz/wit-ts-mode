@@ -121,6 +121,14 @@ bare program name or an absolute path both work."
   :type 'string
   :group 'wit-ts)
 
+(defcustom wit-ts-bindgen-executable "wit-bindgen"
+  "Program used to generate language bindings from WIT.
+Invoked by `wit-ts-bindgen'.  Looked up with `executable-find' on
+the variable `exec-path', so a bare program name or an absolute
+path both work."
+  :type 'string
+  :group 'wit-ts)
+
 (defcustom wit-ts-deps-directory "wit"
   "Name of the directory `wit-deps' manages, relative to the project.
 Its manifest lives at DIR/deps.toml and resolved dependencies at
@@ -779,6 +787,106 @@ See `wit-ts-mode--deps-run' for the execution model and the errors
 this may signal."
   (interactive)
   (wit-ts-mode--deps-run '("update") "update"))
+
+;;; Binding generation (wit-bindgen)
+
+(defvar wit-ts-mode--bindgen-args (make-hash-table :test 'equal)
+  "Session cache of `wit-bindgen' argument strings, keyed by project root.
+Populated by `wit-ts-bindgen' the first time it runs in a project
+so later invocations reuse the same arguments.  Not persisted --
+it is forgotten when Emacs exits.")
+
+(defconst wit-ts-mode--bindgen-languages
+  '("rust" "c" "cpp" "go" "csharp" "moonbit" "markdown")
+  "Target languages `wit-bindgen' can generate bindings for.
+Used only to hint the `wit-ts-bindgen' prompt; the authoritative
+list is whatever the installed `wit-bindgen' supports.")
+
+(defun wit-ts-mode--bindgen-default-args (project-root)
+  "Return a template `wit-bindgen' argument string for PROJECT-ROOT.
+Uses the project's WIT directory as the trailing path, e.g.
+\"rust --out-dir bindings wit\"."
+  (let* ((roots (wit-ts-mode--wit-root))
+         (wit-dir (if roots
+                      (directory-file-name
+                       (file-relative-name (car roots) project-root))
+                    wit-ts-deps-directory)))
+    (format "rust --out-dir bindings %s" wit-dir)))
+
+;;;###autoload
+(defun wit-ts-bindgen (&optional reconfigure)
+  "Generate language bindings for the current project with `wit-bindgen'.
+Prompts for the arguments to pass after `wit-bindgen', in the form
+LANGUAGE [OPTIONS] WIT-PATH (e.g. \"rust --out-dir bindings wit\").
+On the first run the prompt is pre-filled with a template using the
+project's WIT directory; just edit it and confirm.  The program is
+then run asynchronously from the project root, streaming output to
+the `*wit-bindgen*' buffer.
+
+The arguments are remembered per project for the rest of the Emacs
+session, so later invocations reuse them without prompting.  With a
+prefix argument RECONFIGURE, prompt again (pre-filled with the last
+arguments) and store the new value.
+
+Signals a `user-error' if the executable is not found or the buffer
+is not part of a `wit-deps' project (no DIR/deps.toml)."
+  (interactive "P")
+  (unless (executable-find wit-ts-bindgen-executable)
+    (user-error "Cannot find `%s' on `exec-path'; set `wit-ts-bindgen-executable'"
+                wit-ts-bindgen-executable))
+  (let ((roots (wit-ts-mode--wit-root)))
+    (unless roots
+      (user-error "No `%s/deps.toml' found for this buffer"
+                  wit-ts-deps-directory))
+    (let* ((project-root (cdr roots))
+           (remembered (gethash project-root wit-ts-mode--bindgen-args))
+           ;; On the first run, pre-fill a template using the project's WIT
+           ;; dir; afterwards, pre-fill the remembered arguments.
+           (initial (or remembered
+                        (wit-ts-mode--bindgen-default-args project-root)))
+           (args-string
+            (if (and remembered (not reconfigure))
+                remembered
+              (read-string
+               ;; The prompt names the expected form; the hint lists the
+               ;; target languages `wit-bindgen' understands.
+               (format "wit-bindgen args (LANGUAGE [OPTIONS] WIT-PATH; e.g. %s): "
+                       (string-join wit-ts-mode--bindgen-languages ", "))
+               initial)))
+           (args (split-string-and-unquote args-string)))
+      (when (null args)
+        (user-error "No `%s' arguments given" wit-ts-bindgen-executable))
+      (puthash project-root args-string wit-ts-mode--bindgen-args)
+      (wit-ts-mode--bindgen-run project-root args))))
+
+(defun wit-ts-mode--bindgen-run (project-root args)
+  "Run `wit-ts-bindgen-executable' with ARGS from PROJECT-ROOT, asynchronously.
+Streams output to the `*wit-bindgen*' buffer, whose first line
+shows the exact command being run.  ARGS is a list of already-split
+command-line arguments."
+  (let* ((default-directory project-root)
+         (command (cons wit-ts-bindgen-executable args))
+         (command-line (mapconcat #'shell-quote-argument command " "))
+         (buffer (get-buffer-create "*wit-bindgen*")))
+    (with-current-buffer buffer
+      (setq buffer-read-only nil)
+      (erase-buffer)
+      (insert (format "$ %s\n  (in %s)\n\n" command-line default-directory)))
+    (display-buffer buffer)
+    (message "Running: %s" command-line)
+    (make-process
+     :name "wit-bindgen"
+     :buffer buffer
+     :command command
+     :noquery t
+     :sentinel
+     (lambda (proc _event)
+       (when (memq (process-status proc) '(exit signal))
+         (if (and (eq (process-status proc) 'exit)
+                  (zerop (process-exit-status proc)))
+             (message "wit-bindgen: bindings generated")
+           (message "wit-bindgen failed (exit %s); see *wit-bindgen*"
+                    (process-exit-status proc))))))))
 
 (defun wit-ts-mode--in-comment-or-string-p (node)
   "Return non-nil if NODE is, or is inside, a comment or string."
@@ -1463,6 +1571,14 @@ protocol.  Intended for `flymake-diagnostic-functions'."
 
 ;;; Mode definition
 
+(defvar-keymap wit-ts-mode-map
+  :doc "Keymap for `wit-ts-mode'.
+Project-tool commands live under the major-mode-reserved
+`C-c C-<letter>' space."
+  "C-c C-d" #'wit-ts-deps-sync
+  "C-c C-u" #'wit-ts-deps-update
+  "C-c C-b" #'wit-ts-bindgen)
+
 ;;;###autoload
 (define-derived-mode wit-ts-mode prog-mode "WIT"
   "Major mode for editing WIT (WebAssembly Interface Type) files.
@@ -1504,6 +1620,15 @@ Both run the `wit-ts-deps-executable' program asynchronously.
 
 Files under that dependency directory are fetched artifacts, so
 they are visited read-only (see `wit-ts-mode-deps-read-only').
+
+Bindings:
+
+\\[wit-ts-bindgen]
+    Generate language bindings from the project's WIT with
+    `wit-bindgen'.  Prompts for the arguments (e.g. \"rust --out-dir
+    gen wit\"), then remembers them per project for the session; a
+    prefix argument re-prompts.  The exact command is shown in the
+    `*wit-bindgen*' buffer and the echo area.
 
 \\{wit-ts-mode-map}"
   :group 'wit-ts

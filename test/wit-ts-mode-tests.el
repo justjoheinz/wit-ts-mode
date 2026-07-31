@@ -814,6 +814,93 @@ advertises `identity' as its display sort so frontends preserve it."
         (wit-ts-deps-sync)
         (should (equal captured-command '("wit-deps")))))))
 
+;;; Binding generation (wit-bindgen)
+
+(defmacro wit-ts-mode-tests--with-bindgen (input &rest body)
+  "Run BODY with `wit-bindgen' stubbed and `read-string' returning INPUT.
+Binds `captured-command', `captured-dir', `prompt-count',
+`captured-prompt', and `captured-initial' for BODY to inspect, and
+starts each test with an empty args cache."
+  (declare (indent 1) (debug (form body)))
+  `(let ((captured-command nil) (captured-dir nil) (prompt-count 0)
+         (captured-prompt nil) (captured-initial nil)
+         (wit-ts-mode--bindgen-args (make-hash-table :test 'equal)))
+     (cl-letf (((symbol-function 'executable-find)
+                (lambda (&rest _) "wit-bindgen"))
+               ((symbol-function 'display-buffer) #'ignore)
+               ((symbol-function 'make-process)
+                (lambda (&rest args)
+                  (setq captured-command (plist-get args :command)
+                        captured-dir default-directory)
+                  'fake-proc))
+               ((symbol-function 'read-string)
+                (lambda (prompt &optional initial &rest _)
+                  (setq prompt-count (1+ prompt-count)
+                        captured-prompt prompt
+                        captured-initial initial)
+                  ;; Mimic the minibuffer: with no edit, the initial value
+                  ;; is what gets returned.
+                  (or ,input initial))))
+       ,@body)))
+
+(ert-deftest wit-ts-mode-bindgen-runs-and-remembers ()
+  "`wit-ts-bindgen' prompts once, runs from the root, then reuses args."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (wit-ts-mode-tests--with-bindgen "rust --out-dir gen wit"
+      (wit-ts-bindgen)
+      (should (equal captured-command
+                     '("wit-bindgen" "rust" "--out-dir" "gen" "wit")))
+      (should (equal (file-name-nondirectory (directory-file-name captured-dir))
+                     "proj"))
+      (should (= prompt-count 1))
+      ;; Second call reuses the remembered args without prompting.
+      (setq captured-command nil)
+      (wit-ts-bindgen)
+      (should (= prompt-count 1))
+      (should (equal captured-command
+                     '("wit-bindgen" "rust" "--out-dir" "gen" "wit"))))))
+
+(ert-deftest wit-ts-mode-bindgen-prefix-reconfigures ()
+  "A prefix argument makes `wit-ts-bindgen' prompt again."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (wit-ts-mode-tests--with-bindgen "c --out-dir out wit"
+      (wit-ts-bindgen)
+      (should (= prompt-count 1))
+      (wit-ts-bindgen t)              ; prefix -> re-prompt
+      (should (= prompt-count 2)))))
+
+(ert-deftest wit-ts-mode-bindgen-shows-command ()
+  "The exact command line appears in the `*wit-bindgen*' buffer."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (wit-ts-mode-tests--with-bindgen "rust wit"
+      (wit-ts-bindgen)
+      (with-current-buffer "*wit-bindgen*"
+        (should (string-match-p "wit-bindgen rust wit"
+                                (buffer-substring-no-properties
+                                 (point-min) (point-max))))))))
+
+(ert-deftest wit-ts-mode-bindgen-errors-without-executable ()
+  "`wit-ts-bindgen' signals a clear error when the CLI is absent."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
+      (should-error (wit-ts-bindgen) :type 'user-error))))
+
+(ert-deftest wit-ts-mode-bindgen-prompt-guides-and-prefills ()
+  "The prompt explains the argument form and pre-fills a WIT-dir template."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    ;; INPUT nil -> the stub returns the pre-filled initial value.
+    (wit-ts-mode-tests--with-bindgen nil
+      (wit-ts-bindgen)
+      ;; The prompt names the expected form and lists a language.
+      (should (string-match-p "LANGUAGE" captured-prompt))
+      (should (string-match-p "WIT-PATH" captured-prompt))
+      (should (string-match-p "rust" captured-prompt))
+      ;; The template pre-fill ends with the project's WIT directory.
+      (should (string-match-p "\\bwit\\'" captured-initial))
+      ;; With no edit, that template is what runs.
+      (should (equal (car captured-command) "wit-bindgen"))
+      (should (member "wit" captured-command)))))
+
 (provide 'wit-ts-mode-tests)
 
 ;;; wit-ts-mode-tests.el ends here
