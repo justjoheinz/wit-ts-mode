@@ -173,6 +173,20 @@ errors as you type. Two kinds are reported, each with a descriptive message:
   (e.g. `Syntax error: expected semicolon `;'` or `expected closing brace
   `}'` for an unterminated block).
 
+Beyond parse errors, the backend also flags **unresolved references** as
+warnings (toggle with `wit-ts-mode-check-references`):
+
+- **unknown types** — any type reference that is neither a builtin, a type
+  defined in the buffer, nor a `use`-imported name, wherever it appears: a
+  `type` alias target, a record field, a variant payload, a function
+  parameter or return type, an element of `list`/`option`/`result`/`tuple`,
+  a `borrow`/`own` handle, and so on (e.g. `Unknown type `widget'`). This is
+  a whole-buffer check, so it works even outside a project.
+- **unresolved interface paths and members** — in a
+  [`wit-deps`][wit-deps]-managed project, an `import`/`export`/`use` path to a
+  missing package or interface, and members of a `use PATH.{ … }` list not
+  defined in that interface (see below).
+
 Jump between them with `M-x flymake-goto-next-error` /
 `flymake-goto-prev-error`, or list them with `M-x
 flymake-show-buffer-diagnostics`. In Doom, Flymake is enabled automatically
@@ -213,37 +227,46 @@ front-end (Corfu or Company) just works.
 ### Cross-file symbols and dependencies
 
 There is no WIT language server, so `wit-ts-mode` resolves cross-file symbols
-itself. A project laid out for the [`wit-deps`][wit-deps] CLI has a manifest at
-`wit/deps.toml` and resolved dependency sources under `wit/deps/`. When the
-current file lives in such a tree, completion parses the other `.wit` files
-there (with the same tree-sitter grammar) and offers their definitions too.
+itself. A WIT project keeps its sources in a `wit/` directory with resolved
+dependency sources under `wit/deps/`; [`wit-deps`][wit-deps] projects also have
+a `wit/deps.toml` manifest. When the current file lives in such a tree,
+completion parses the other `.wit` files there (with the same tree-sitter
+grammar) and offers their definitions too.
 
 To fetch or refresh the dependencies, run one of:
 
 ```
-M-x wit-ts-deps-sync     ; wit-deps        — populate deps/ from the lock file
-M-x wit-ts-deps-update   ; wit-deps update — pull latest, rewrite the lock file
+M-x wit-ts-deps-sync     ; populate deps/ from the lock file
+M-x wit-ts-deps-update   ; pull latest, rewrite the lock file
 ```
 
-`wit-ts-deps-sync` runs bare `wit-deps` (equivalent to `wit-deps lock`): it
-populates `wit/deps/` from the manifest while honouring the existing
-`deps.lock`, so pinned versions do not change. `wit-ts-deps-update` runs
-`wit-deps update`, pulling the latest sources for dynamic references (such as a
-tracked branch) and rewriting `deps.lock`.
+`wit-ts-deps-sync` populates `wit/deps/` from the manifest while honouring the
+existing lock file, so pinned versions do not change. `wit-ts-deps-update`
+pulls the latest sources for dynamic references (such as a tracked branch) and
+rewrites the lock file.
 
-Both invoke `wit-ts-deps-executable` (default `wit-deps`) in the project root,
-streaming output to the `*wit-deps*` buffer; on success the resolved sources
-become available to completion. The mode never runs the CLI implicitly — no
-network access happens unless you ask for it — and it does not author
-`deps.toml` for you; supply your own manifest. The managed directory name
-defaults to `wit` but is configurable via `wit-ts-deps-directory`, matching the
-corresponding `wit-deps` option.
+Which tool backs those commands is decided per project by
+`wit-ts-deps-tool-function`. The default finds the `wit/` directory and picks
+[`wit-deps`][wit-deps] when it contains a `deps.toml` (run bare for sync,
+`wit-deps update` for update), otherwise [`wkg`][wkg] (wasm-pkg-tools:
+`wkg fetch` for sync, `wkg update` for update). Override the function to force
+one tool or key the choice on some other marker; the executables are
+`wit-ts-deps-executable` (default `wit-deps`) and `wit-ts-wkg-executable`
+(default `wkg`).
+
+The chosen tool runs in the project root, streaming output to a buffer named
+for it; on success the resolved sources become available to completion. The
+mode never runs a tool implicitly — no network access happens unless you ask
+for it — and it does not author `deps.toml` for you; supply your own manifest.
+The WIT directory name defaults to `wit` but is configurable via
+`wit-ts-deps-directory`.
 
 Off-buffer files are parsed on demand and cached by modification time, so
-completion stays cheap even with a large `wit/deps/` tree; both commands clear
-that cache on success.
+completion stays cheap even with a large `wit/deps/` tree; both commands
+clear that cache on success.
 
 [wit-deps]: https://github.com/bytecodealliance/wit-deps
+[wkg]: https://github.com/bytecodealliance/wasm-pkg-tools
 
 ## Highlighting notes
 

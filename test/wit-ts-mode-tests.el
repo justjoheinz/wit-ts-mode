@@ -375,18 +375,39 @@ tree.  Skips the test if the WIT grammar is not ready."
            (setq buffer-file-name nil))))))
 
 (ert-deftest wit-ts-mode-wit-root-locates-managed-dir ()
-  "`wit-ts-mode--wit-root' finds the deps.toml root and project root."
+  "`wit-ts-mode--wit-root' finds the WIT directory and project root."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
     (let* ((roots (wit-ts-mode--wit-root))
            (wit-root (car roots))
            (project-root (cdr roots)))
       (should roots)
-      (should (file-exists-p (expand-file-name "deps.toml" wit-root)))
       (should (equal (file-name-nondirectory (directory-file-name wit-root))
                      "wit"))
-      ;; Project root is the parent, where `wit-deps' would run.
+      ;; Project root is the parent, where the dependency tool would run.
       (should (equal (expand-file-name wit-root)
                      (expand-file-name "wit/" project-root))))))
+
+(ert-deftest wit-ts-mode-wit-root-found-without-manifest ()
+  "`wit-ts-mode--wit-root' recognises a `wit' directory with no `deps.toml'.
+This is the layout a fresh `wkg' project has before dependencies
+are fetched."
+  (skip-unless (treesit-ready-p 'wit t))
+  (let ((dir (make-temp-file "wit-ts-root-" t)))
+    (unwind-protect
+        (let ((wit-dir (expand-file-name "wit/" dir)))
+          (make-directory wit-dir)
+          (with-temp-file (expand-file-name "root.wit" wit-dir)
+            (insert "package example:root;\n"))
+          (should-not (file-exists-p (expand-file-name "deps.toml" wit-dir)))
+          (with-temp-buffer
+            (setq buffer-file-name (expand-file-name "root.wit" wit-dir))
+            (unwind-protect
+                (let ((roots (wit-ts-mode--wit-root)))
+                  (should roots)
+                  (should (equal (expand-file-name (car roots))
+                                 (expand-file-name wit-dir))))
+              (setq buffer-file-name nil))))
+      (delete-directory dir t))))
 
 (ert-deftest wit-ts-mode-parse-file-extracts-package-and-interfaces ()
   "`wit-ts-mode--parse-file' returns the package id, version, and interfaces."
@@ -777,6 +798,203 @@ advertises `identity' as its display sort so frontends preserve it."
       (should (wit-ts-mode--in-deps-directory-p))
       (should-not buffer-read-only))))
 
+;;; Semantic reference checking
+
+(defun wit-ts-mode-tests--reference-texts (&optional extra)
+  "Return reference-check diagnostic messages for proj/wit/root.wit.
+EXTRA, if given, is appended to the buffer before checking."
+  (when extra (goto-char (point-max)) (insert extra))
+  (mapcar #'flymake-diagnostic-text
+          (wit-ts-mode--reference-diagnostics
+           (wit-ts-mode--parser) (current-buffer))))
+
+(ert-deftest wit-ts-mode-reference-unknown-package ()
+  "A reference to a package absent from the project is flagged."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  "\nworld w {\n  import totally:bogus/thing;\n}\n")))
+      (should (seq-some (lambda (m) (string-match-p "Unknown package `totally:bogus'" m))
+                        texts)))))
+
+(ert-deftest wit-ts-mode-reference-unknown-interface-in-package ()
+  "A known package but undefined interface is flagged."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  "\nworld w {\n  import example:dep/no-iface@0.1.0;\n}\n")))
+      (should (seq-some
+               (lambda (m)
+                 (string-match-p
+                  "Interface `no-iface' is not defined in package `example:dep'" m))
+               texts)))))
+
+(ert-deftest wit-ts-mode-reference-unknown-local-interface ()
+  "A bare reference to a non-existent local interface is flagged."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  "\nworld w {\n  export no-such-local;\n}\n")))
+      (should (seq-some
+               (lambda (m)
+                 (string-match-p "Interface `no-such-local' is not defined" m))
+               texts)))))
+
+(ert-deftest wit-ts-mode-reference-valid-refs-clean ()
+  "Valid qualified and local references add no new warnings."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((before (length (wit-ts-mode-tests--reference-texts)))
+          (after (length (wit-ts-mode-tests--reference-texts
+                          (concat "\ninterface q {\n"
+                                  "  use example:dep/dep-iface@0.1.0.{widget};\n}\n"
+                                  "world w {\n  export sibling-iface;\n}\n")))))
+      ;; The added references resolve, so the warning count is unchanged.
+      (should (= before after)))))
+
+(ert-deftest wit-ts-mode-reference-undefined-member ()
+  "A `use' names-list member not defined in the interface is flagged."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  (concat "\ninterface q {\n"
+                          "  use example:dep/dep-iface@0.1.0.{widget, bogus};\n}\n"))))
+      (should (seq-some
+               (lambda (m)
+                 (string-match-p "`bogus' is not defined in interface `dep-iface'" m))
+               texts))
+      ;; The valid member `widget' is not flagged.
+      (should-not (seq-some (lambda (m) (string-match-p "`widget'" m)) texts)))))
+
+(ert-deftest wit-ts-mode-reference-unknown-param-type ()
+  "A function parameter whose type is undefined is flagged."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  (concat "\ninterface q {\n"
+                          "  frob: func(n: u32, w: no-such-type);\n}\n"))))
+      (should (seq-some
+               (lambda (m) (string-match-p "Unknown type `no-such-type'" m))
+               texts))
+      ;; The builtin `u32' parameter is not flagged.
+      (should-not (seq-some (lambda (m) (string-match-p "`u32'" m)) texts)))))
+
+(ert-deftest wit-ts-mode-reference-known-func-types-clean ()
+  "Builtin, locally-defined, and `use'-imported func types are not flagged."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((before (length (wit-ts-mode-tests--reference-texts)))
+          (after (length (wit-ts-mode-tests--reference-texts
+                          (concat "\ninterface q {\n"
+                                  "  use example:dep/dep-iface@0.1.0.{widget};\n"
+                                  "  record local-rec { a: u32 }\n"
+                                  "  type alias = u64;\n"
+                                  ;; builtin, local record, local alias, and a
+                                  ;; `use'-imported name -- all resolve.
+                                  "  frob: func(a: string, b: local-rec,\n"
+                                  "             c: alias, d: widget)"
+                                  " -> local-rec;\n}\n")))))
+      (should (= before after)))))
+
+(ert-deftest wit-ts-mode-reference-unknown-return-type ()
+  "A function return type that is undefined is flagged."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  (concat "\ninterface q {\n"
+                          "  sub: func() -> unknown;\n}\n"))))
+      (should (seq-some
+               (lambda (m) (string-match-p "Unknown type `unknown'" m))
+               texts)))))
+
+(ert-deftest wit-ts-mode-reference-return-type-in-result-flagged ()
+  "Unknown types inside a `result<ok, err>' return are flagged; known ones not."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  (concat "\ninterface q {\n"
+                          "  record ok-rec { a: u32 }\n"
+                          "  go: func() -> result<ok-rec, oops>;\n}\n"))))
+      (should (seq-some (lambda (m) (string-match-p "Unknown type `oops'" m))
+                        texts))
+      ;; The declared `ok-rec' return payload resolves.
+      (should-not (seq-some (lambda (m) (string-match-p "`ok-rec'" m)) texts)))))
+
+(ert-deftest wit-ts-mode-reference-nested-and-handle-types ()
+  "Unknown types nested in generics or a `borrow' handle are flagged."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  (concat "\ninterface q {\n"
+                          "  resource res {}\n"
+                          "  a: func(xs: list<mystery>);\n"
+                          "  b: func(r: borrow<res>, s: borrow<ghost>);\n}\n"))))
+      (should (seq-some (lambda (m) (string-match-p "Unknown type `mystery'" m))
+                        texts))
+      (should (seq-some (lambda (m) (string-match-p "Unknown type `ghost'" m))
+                        texts))
+      ;; The declared resource `res' resolves.
+      (should-not (seq-some (lambda (m) (string-match-p "`res'" m)) texts)))))
+
+(ert-deftest wit-ts-mode-reference-unknown-type-alias-target ()
+  "A `type' alias whose target type is undefined is flagged."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  "\ninterface q {\n  type foo = unknown;\n}\n")))
+      (should (seq-some (lambda (m) (string-match-p "Unknown type `unknown'" m))
+                        texts)))))
+
+(ert-deftest wit-ts-mode-reference-unknown-record-field-type ()
+  "A record field whose type is undefined is flagged; a builtin one is not."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  (concat "\ninterface q {\n"
+                          "  record foo { i: unknown, j: u32 }\n}\n"))))
+      (should (seq-some (lambda (m) (string-match-p "Unknown type `unknown'" m))
+                        texts))
+      (should-not (seq-some (lambda (m) (string-match-p "`u32'" m)) texts)))))
+
+(ert-deftest wit-ts-mode-reference-unknown-variant-payload-type ()
+  "A variant case payload of an undefined type is flagged."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  (concat "\ninterface q {\n"
+                          "  variant v { a(mystery), b(u32), c }\n}\n"))))
+      (should (seq-some (lambda (m) (string-match-p "Unknown type `mystery'" m))
+                        texts)))))
+
+(ert-deftest wit-ts-mode-reference-type-forward-reference-clean ()
+  "A field referring to a type defined later in the buffer resolves."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((before (length (wit-ts-mode-tests--reference-texts)))
+          (after (length (wit-ts-mode-tests--reference-texts
+                          (concat "\ninterface q {\n"
+                                  ;; `point' is used before its definition;
+                                  ;; scope is whole-buffer, so it resolves.
+                                  "  record line { from: point, to: point }\n"
+                                  "  record point { x: u32, y: u32 }\n}\n")))))
+      (should (= before after)))))
+
+(ert-deftest wit-ts-mode-reference-type-checked-outside-project ()
+  "Type-reference checking runs even outside a `wit-deps' project."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface i {\n"
+            "  type t = nope;\n  f: func(x: alsobad);\n}\n")
+    (wit-ts-mode)
+    ;; No project index here, but the in-buffer type check still fires,
+    ;; covering both a `type' target and a function parameter.
+    (let ((texts (mapcar #'flymake-diagnostic-text
+                         (wit-ts-mode--reference-diagnostics
+                          (wit-ts-mode--parser) (current-buffer)))))
+      (should (seq-some (lambda (m) (string-match-p "Unknown type `nope'" m))
+                        texts))
+      (should (seq-some (lambda (m) (string-match-p "Unknown type `alsobad'" m))
+                        texts)))))
+
+(ert-deftest wit-ts-mode-reference-check-disabled ()
+  "With `wit-ts-mode-check-references' nil, the backend adds no warnings."
+  (skip-unless (treesit-ready-p 'wit t))
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  import totally:bogus/thing;\n}\n")
+    (let* ((wit-ts-mode-check-references nil)
+           (out nil))
+      (wit-ts-mode-flymake (lambda (diags) (setq out diags)))
+      (should-not (seq-some
+                   (lambda (d) (eq (flymake-diagnostic-type d) :warning))
+                   out)))))
+
 ;;; Dependency synchronisation
 
 (ert-deftest wit-ts-mode-deps-sync-errors-without-executable ()
@@ -793,9 +1011,23 @@ advertises `identity' as its display sort so frontends preserve it."
     (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
       (should-error (wit-ts-deps-update) :type 'user-error))))
 
-(ert-deftest wit-ts-mode-deps-run-passes-args-and-dir ()
-  "`wit-ts-mode--deps-run' runs the CLI with the right args in the root."
+(ert-deftest wit-ts-mode-default-deps-tool-keys-on-manifest ()
+  "`wit-ts-mode--default-deps-tool' picks `wit-deps' iff a `deps.toml' exists."
+  (let ((dir (make-temp-file "wit-ts-tool-" t)))
+    (unwind-protect
+        (progn
+          ;; No manifest yet: falls back to `wkg'.
+          (should (eq (wit-ts-mode--default-deps-tool dir) 'wkg))
+          ;; With a `deps.toml' present: `wit-deps'.
+          (with-temp-file (expand-file-name "deps.toml" dir) (insert ""))
+          (should (eq (wit-ts-mode--default-deps-tool dir) 'wit-deps)))
+      (delete-directory dir t))))
+
+(ert-deftest wit-ts-mode-deps-run-uses-wit-deps-for-manifest-project ()
+  "With a `deps.toml', sync/update drive `wit-deps' in the project root."
   (skip-unless (treesit-ready-p 'wit t))
+  ;; The `proj/wit' fixture ships a `deps.toml', so the default tool
+  ;; function selects `wit-deps'.
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
     (let (captured-command captured-dir)
       (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) "wit-deps"))
@@ -814,19 +1046,48 @@ advertises `identity' as its display sort so frontends preserve it."
         (wit-ts-deps-sync)
         (should (equal captured-command '("wit-deps")))))))
 
-;;; Binding generation (wit-bindgen)
+(ert-deftest wit-ts-mode-deps-run-uses-wkg-when-selected ()
+  "When `wit-ts-deps-tool-function' returns `wkg', sync/update drive `wkg'."
+  (skip-unless (treesit-ready-p 'wit t))
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((wit-ts-deps-tool-function (lambda (&rest _) 'wkg))
+          captured-command captured-dir)
+      (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) "wkg"))
+                ((symbol-function 'make-process)
+                 (lambda (&rest args)
+                   (setq captured-command (plist-get args :command)
+                         captured-dir default-directory)
+                   nil)))
+        (wit-ts-deps-sync)
+        (should (equal captured-command '("wkg" "fetch")))
+        (should (equal (file-name-nondirectory
+                        (directory-file-name captured-dir))
+                       "proj"))
+        (wit-ts-deps-update)
+        (should (equal captured-command '("wkg" "update")))))))
 
-(defmacro wit-ts-mode-tests--with-bindgen (input &rest body)
-  "Run BODY with `wit-bindgen' stubbed and `read-string' returning INPUT.
+(ert-deftest wit-ts-mode-deps-run-errors-on-unknown-tool ()
+  "A `wit-ts-deps-tool-function' returning an unknown symbol errors clearly."
+  (skip-unless (treesit-ready-p 'wit t))
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((wit-ts-deps-tool-function (lambda (&rest _) 'bogus)))
+      (should-error (wit-ts-deps-sync) :type 'user-error))))
+
+;;; Binding / component generation
+
+(defmacro wit-ts-mode-tests--with-generate (input &rest body)
+  "Run BODY with the generate tools stubbed and `read-string' returning INPUT.
 Binds `captured-command', `captured-dir', `prompt-count',
 `captured-prompt', and `captured-initial' for BODY to inspect, and
-starts each test with an empty args cache."
+starts each test with an empty args cache.  `executable-find'
+reports every program as present, so the tool selected by
+`wit-ts-deps-tool-function' is what runs."
   (declare (indent 1) (debug (form body)))
   `(let ((captured-command nil) (captured-dir nil) (prompt-count 0)
          (captured-prompt nil) (captured-initial nil)
-         (wit-ts-mode--bindgen-args (make-hash-table :test 'equal)))
+         (wit-ts-mode--generate-args (make-hash-table :test 'equal)))
      (cl-letf (((symbol-function 'executable-find)
-                (lambda (&rest _) "wit-bindgen"))
+                (lambda (name &rest _) name))
                ((symbol-function 'display-buffer) #'ignore)
                ((symbol-function 'make-process)
                 (lambda (&rest args)
@@ -843,11 +1104,13 @@ starts each test with an empty args cache."
                   (or ,input initial))))
        ,@body)))
 
-(ert-deftest wit-ts-mode-bindgen-runs-and-remembers ()
-  "`wit-ts-bindgen' prompts once, runs from the root, then reuses args."
+(ert-deftest wit-ts-mode-generate-runs-and-remembers ()
+  "`wit-ts-generate' prompts once, runs from the root, then reuses args."
+  ;; The `proj/wit' fixture has a `deps.toml', so the default tool
+  ;; function selects `wit-bindgen'.
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
-    (wit-ts-mode-tests--with-bindgen "rust --out-dir gen wit"
-      (wit-ts-bindgen)
+    (wit-ts-mode-tests--with-generate "rust --out-dir gen wit"
+      (wit-ts-generate)
       (should (equal captured-command
                      '("wit-bindgen" "rust" "--out-dir" "gen" "wit")))
       (should (equal (file-name-nondirectory (directory-file-name captured-dir))
@@ -855,42 +1118,55 @@ starts each test with an empty args cache."
       (should (= prompt-count 1))
       ;; Second call reuses the remembered args without prompting.
       (setq captured-command nil)
-      (wit-ts-bindgen)
+      (wit-ts-generate)
       (should (= prompt-count 1))
       (should (equal captured-command
                      '("wit-bindgen" "rust" "--out-dir" "gen" "wit"))))))
 
-(ert-deftest wit-ts-mode-bindgen-prefix-reconfigures ()
-  "A prefix argument makes `wit-ts-bindgen' prompt again."
+(ert-deftest wit-ts-mode-generate-uses-cargo-component-for-wkg ()
+  "For a `wkg' project, `wit-ts-generate' runs `cargo-component build'."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
-    (wit-ts-mode-tests--with-bindgen "c --out-dir out wit"
-      (wit-ts-bindgen)
+    (let ((wit-ts-deps-tool-function (lambda (&rest _) 'wkg)))
+      (wit-ts-mode-tests--with-generate nil  ; accept the pre-filled template
+        (wit-ts-generate)
+        (should (equal captured-command '("cargo-component" "build")))
+        (should (string-match-p "cargo-component" captured-prompt))
+        (should (equal captured-initial "build"))
+        (should (equal (file-name-nondirectory
+                        (directory-file-name captured-dir))
+                       "proj"))))))
+
+(ert-deftest wit-ts-mode-generate-prefix-reconfigures ()
+  "A prefix argument makes `wit-ts-generate' prompt again."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (wit-ts-mode-tests--with-generate "c --out-dir out wit"
+      (wit-ts-generate)
       (should (= prompt-count 1))
-      (wit-ts-bindgen t)              ; prefix -> re-prompt
+      (wit-ts-generate t)              ; prefix -> re-prompt
       (should (= prompt-count 2)))))
 
-(ert-deftest wit-ts-mode-bindgen-shows-command ()
-  "The exact command line appears in the `*wit-bindgen*' buffer."
+(ert-deftest wit-ts-mode-generate-shows-command ()
+  "The exact command line appears in the tool's output buffer."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
-    (wit-ts-mode-tests--with-bindgen "rust wit"
-      (wit-ts-bindgen)
+    (wit-ts-mode-tests--with-generate "rust wit"
+      (wit-ts-generate)
       (with-current-buffer "*wit-bindgen*"
         (should (string-match-p "wit-bindgen rust wit"
                                 (buffer-substring-no-properties
                                  (point-min) (point-max))))))))
 
-(ert-deftest wit-ts-mode-bindgen-errors-without-executable ()
-  "`wit-ts-bindgen' signals a clear error when the CLI is absent."
+(ert-deftest wit-ts-mode-generate-errors-without-executable ()
+  "`wit-ts-generate' signals a clear error when the CLI is absent."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
     (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
-      (should-error (wit-ts-bindgen) :type 'user-error))))
+      (should-error (wit-ts-generate) :type 'user-error))))
 
-(ert-deftest wit-ts-mode-bindgen-prompt-guides-and-prefills ()
+(ert-deftest wit-ts-mode-generate-prompt-guides-and-prefills ()
   "The prompt explains the argument form and pre-fills a WIT-dir template."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
     ;; INPUT nil -> the stub returns the pre-filled initial value.
-    (wit-ts-mode-tests--with-bindgen nil
-      (wit-ts-bindgen)
+    (wit-ts-mode-tests--with-generate nil
+      (wit-ts-generate)
       ;; The prompt names the expected form and lists a language.
       (should (string-match-p "LANGUAGE" captured-prompt))
       (should (string-match-p "WIT-PATH" captured-prompt))

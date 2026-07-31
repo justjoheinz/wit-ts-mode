@@ -114,27 +114,63 @@ run `M-x treesit-install-language-grammar RET wit RET'")))
   :group 'wit-ts)
 
 (defcustom wit-ts-deps-executable "wit-deps"
-  "Program used to resolve WIT dependencies.
-Invoked by `wit-ts-deps-sync' to populate the dependency directory.
-Looked up with `executable-find' on the variable `exec-path', so a
-bare program name or an absolute path both work."
+  "Program used to resolve WIT dependencies with a `deps.toml' manifest.
+Chosen by the default `wit-ts-deps-tool-function' for projects with
+a `deps.toml'; `wit-ts-deps-sync' invokes it bare and
+`wit-ts-deps-update' as `wit-deps update'.  Looked up with
+`executable-find' on the variable `exec-path', so a bare program
+name or an absolute path both work."
+  :type 'string
+  :group 'wit-ts)
+
+(defcustom wit-ts-wkg-executable "wkg"
+  "Program used to resolve WIT dependencies with wasm-pkg-tools.
+Chosen by the default `wit-ts-deps-tool-function' for projects
+without a `deps.toml' manifest; `wit-ts-deps-sync' invokes it as
+`wkg fetch' and `wit-ts-deps-update' as `wkg update'.  Looked up
+with `executable-find' on the variable `exec-path', so a bare
+program name or an absolute path both work."
   :type 'string
   :group 'wit-ts)
 
 (defcustom wit-ts-bindgen-executable "wit-bindgen"
   "Program used to generate language bindings from WIT.
-Invoked by `wit-ts-bindgen'.  Looked up with `executable-find' on
-the variable `exec-path', so a bare program name or an absolute
-path both work."
+Invoked by `wit-ts-generate' for `wit-deps' projects.  Looked up
+with `executable-find' on the variable `exec-path', so a bare
+program name or an absolute path both work."
+  :type 'string
+  :group 'wit-ts)
+
+(defcustom wit-ts-cargo-component-executable "cargo-component"
+  "Program used to build a WebAssembly component with cargo-component.
+Invoked by `wit-ts-generate' for `wkg' projects, as `cargo-component
+build': it regenerates the component's bindings and builds it.
+Looked up with `executable-find' on the variable `exec-path', so a
+bare program name or an absolute path both work."
   :type 'string
   :group 'wit-ts)
 
 (defcustom wit-ts-deps-directory "wit"
-  "Name of the directory `wit-deps' manages, relative to the project.
-Its manifest lives at DIR/deps.toml and resolved dependencies at
-DIR/deps/.  `wit' is the `wit-deps' default but is configurable,
-so `wit-ts-mode' does not hardcode it."
+  "Name of the WIT directory, relative to the project root.
+Holds the project's `.wit' sources, with resolved dependencies
+under DIR/deps/ and, for `wit-deps' projects, a DIR/deps.toml
+manifest.  `wit' is the tools' default but is configurable, so
+`wit-ts-mode' does not hardcode it."
   :type 'string
+  :group 'wit-ts)
+
+(defcustom wit-ts-deps-tool-function #'wit-ts-mode--default-deps-tool
+  "Function that selects the dependency tool for the current project.
+Called with one argument, WIT-ROOT (the `wit-ts-deps-directory' as
+an absolute directory name), and must return one of the symbols
+`wit-deps' or `wkg' -- the tool `wit-ts-deps-sync' and
+`wit-ts-deps-update' should drive.
+
+The default, `wit-ts-mode--default-deps-tool', returns `wit-deps'
+when WIT-ROOT contains a `deps.toml' manifest and `wkg'
+otherwise.  Override it to force one tool, or to key the choice on
+some other project marker."
+  :type 'function
   :group 'wit-ts)
 
 (defcustom wit-ts-mode-deps-read-only t
@@ -142,6 +178,19 @@ so `wit-ts-mode' does not hardcode it."
 Files under the `wit-deps'-managed DIR/deps/ directory are fetched
 artifacts, not sources to edit (e.g. those reached by jumping to a
 definition).  Set to nil to allow editing them."
+  :type 'boolean
+  :group 'wit-ts)
+
+(defcustom wit-ts-mode-check-references t
+  "When non-nil, Flymake warns about unresolved WIT references.
+Checks that every type reference (in a `type' alias, record field,
+variant payload, function signature, and so on) resolves to a
+builtin, a locally-defined type, or a `use'-imported name.  In a
+`wit-deps' project (see `wit-ts-mode--wit-root') it additionally
+checks that the interface named in an `import'/`export'/`use' path
+exists (locally or in the referenced package under DIR/deps/) and
+that the members of a `use PATH.{ ... }' list are defined in that
+interface.  Requires `flymake-mode' to show results."
   :type 'boolean
   :group 'wit-ts)
 
@@ -492,49 +541,38 @@ path, where `wit-ts-mode--path-candidates' supplies them."
 
 ;; Real WIT projects span several files: sibling files within one package and
 ;; foreign packages pulled in via `use'/`import'.  There is no WIT language
-;; server, so symbols outside the current buffer are otherwise invisible.  The
-;; `wit-deps' CLI resolves declared dependencies into DIR/deps/ on disk; once
-;; the sources are there we parse them with the same tree-sitter grammar the
-;; mode already loads and fold their definitions into completion.
+;; server, so symbols outside the current buffer are otherwise invisible.  A
+;; dependency tool (`wit-deps' or `wkg') resolves declared dependencies into
+;; DIR/deps/ on disk; once the sources are there we parse them with the same
+;; tree-sitter grammar the mode already loads and fold their definitions into
+;; completion.
 
 (defun wit-ts-mode--wit-root ()
-  "Locate the `wit-deps'-managed directory for the current buffer.
+  "Locate the WIT directory for the current buffer.
 Return a cons (WIT-ROOT . PROJECT-ROOT), where WIT-ROOT is the
-directory holding deps.toml and PROJECT-ROOT is the directory in
-which `wit-deps' should run (WIT-ROOT's parent).  Return nil when
-the buffer is not visiting a file or no manifest is found.
+`wit-ts-deps-directory' that holds the project's `.wit' sources
+\(with resolved dependencies under WIT-ROOT/deps/) and
+PROJECT-ROOT is its parent, the directory in which the dependency
+tool runs.  Return nil when the buffer is not visiting a file
+under such a directory.
 
-Two layouts are recognised, walking up from the buffer's file:
-an ancestor DIR containing `wit-ts-deps-directory'/deps.toml (root
-is that subdirectory), or an ancestor that is itself the managed
-directory and contains deps.toml directly."
+WIT-ROOT is the nearest ancestor of the buffer's file whose name
+is `wit-ts-deps-directory' (\"wit\" by default).  A `deps.toml' is
+not required, so projects managed by either `wit-deps' or `wkg'
+are recognised; which tool applies is decided later, per
+`wit-ts-deps-tool-function'."
   (when-let* ((file buffer-file-name)
-              (start (file-name-directory file)))
-    (let (result)
+              (start (file-name-directory (expand-file-name file))))
+    (let (root)
       (locate-dominating-file
        start
        (lambda (dir)
-         (let ((nested (expand-file-name
-                        (concat (file-name-as-directory wit-ts-deps-directory)
-                                "deps.toml")
-                        dir)))
-           (cond
-            ((file-exists-p nested)
-             (setq result
-                   (cons (file-name-directory nested)
-                         (file-name-as-directory (expand-file-name dir))))
-             t)
-            ((and (file-exists-p (expand-file-name "deps.toml" dir))
-                  (equal (file-name-nondirectory
-                          (directory-file-name dir))
-                         wit-ts-deps-directory))
-             (setq result
-                   (cons (file-name-as-directory (expand-file-name dir))
-                         (file-name-directory
-                          (directory-file-name dir))))
-             t)
-            (t nil)))))
-      result)))
+         (when (equal (file-name-nondirectory (directory-file-name dir))
+                      wit-ts-deps-directory)
+           (setq root (file-name-as-directory (expand-file-name dir)))
+           t)))
+      (when root
+        (cons root (file-name-directory (directory-file-name root)))))))
 
 (defun wit-ts-mode--in-deps-directory-p ()
   "Return non-nil if the current buffer's file is under DIR/deps/.
@@ -719,28 +757,66 @@ list.  Return nil when the path or interface cannot be resolved."
 
 ;;; Dependency synchronisation
 
-(defun wit-ts-mode--deps-run (args label)
-  "Run `wit-ts-deps-executable' with ARGS asynchronously for this project.
-ARGS is a list of extra command-line arguments (nil for the bare
-`lock' behaviour).  LABEL names the operation in progress messages.
-The process runs in the project root (the parent of the
-`wit-deps'-managed directory), streaming output to the `*wit-deps*'
-buffer.  On success the off-buffer definitions cache is cleared so
-the next completion re-scans the resolved sources.
+(defun wit-ts-mode--default-deps-tool (wit-root)
+  "Return the default dependency tool for WIT-ROOT.
+`wit-deps' when WIT-ROOT holds a `deps.toml' manifest, else `wkg'.
+This is the default value of `wit-ts-deps-tool-function'."
+  (if (file-exists-p (expand-file-name "deps.toml" wit-root))
+      'wit-deps
+    'wkg))
 
-Signals a `user-error' if the executable is not found or the
-current buffer is not part of a `wit-deps' project (no
-DIR/deps.toml)."
-  (unless (executable-find wit-ts-deps-executable)
-    (user-error "Cannot find `%s' on `exec-path'; set `wit-ts-deps-executable'"
-                wit-ts-deps-executable))
+(defun wit-ts-mode--deps-command (operation)
+  "Return the command for OPERATION in the current project, or signal.
+OPERATION is `sync' or `update'.  Locates the project's WIT root,
+asks `wit-ts-deps-tool-function' which tool to drive, and maps the
+pair to the concrete invocation.  The result is a plist with keys
+:executable (the program name), :exec-var (its custom variable,
+for error messages), :args (extra arguments), and :root (the
+project root the process should run in).
+
+Signals a `user-error' when the buffer is not under a
+`wit-ts-deps-directory' or the tool function returns an unknown
+symbol."
   (let ((roots (wit-ts-mode--wit-root)))
     (unless roots
-      (user-error "No `%s/deps.toml' found for this buffer"
+      (user-error "No `%s' directory found for this buffer"
                   wit-ts-deps-directory))
-    (let* ((default-directory (cdr roots))
-           (command (cons wit-ts-deps-executable args))
-           (buffer (get-buffer-create "*wit-deps*")))
+    (let ((tool (funcall wit-ts-deps-tool-function (car roots))))
+      (pcase tool
+        ('wit-deps
+         (list :executable wit-ts-deps-executable
+               :exec-var 'wit-ts-deps-executable
+               :args (and (eq operation 'update) '("update"))
+               :root (cdr roots)))
+        ('wkg
+         (list :executable wit-ts-wkg-executable
+               :exec-var 'wit-ts-wkg-executable
+               :args (list (if (eq operation 'update) "update" "fetch"))
+               :root (cdr roots)))
+        (_ (user-error "`wit-ts-deps-tool-function' returned unknown tool `%S'"
+                       tool))))))
+
+(defun wit-ts-mode--deps-run (operation label)
+  "Run the dependency tool for OPERATION asynchronously for this project.
+OPERATION is `sync' or `update'; LABEL names it in progress
+messages.  The tool and its arguments are resolved by
+`wit-ts-mode--deps-command' (which picks `wit-deps' or `wkg' per
+`wit-ts-deps-tool-function').  The process runs in the project
+root, streaming output to a buffer named for the executable.  On
+success the off-buffer definitions cache is cleared so the next
+completion re-scans the resolved sources.
+
+Signals a `user-error' if the buffer is not under a
+`wit-ts-deps-directory' or the chosen executable is not found."
+  (let* ((plan (wit-ts-mode--deps-command operation))
+         (executable (plist-get plan :executable))
+         (exec-var (plist-get plan :exec-var)))
+    (unless (executable-find executable)
+      (user-error "Cannot find `%s' on `exec-path'; set `%s'"
+                  executable exec-var))
+    (let* ((default-directory (plist-get plan :root))
+           (command (cons executable (plist-get plan :args)))
+           (buffer (get-buffer-create (format "*%s*" executable))))
       (with-current-buffer buffer
         (setq buffer-read-only nil)
         (erase-buffer)
@@ -748,7 +824,7 @@ DIR/deps.toml)."
                         (mapconcat #'identity command " ")
                         default-directory)))
       (make-process
-       :name "wit-deps"
+       :name executable
        :buffer buffer
        :command command
        :noquery t
@@ -759,115 +835,147 @@ DIR/deps.toml)."
                     (zerop (process-exit-status proc)))
                (progn
                  (clrhash wit-ts-mode--definitions-cache)
-                 (message "wit-deps: %s complete" label))
-             (message "wit-deps %s failed (exit %s); see *wit-deps*"
-                      label (process-exit-status proc)))))))))
+                 (message "%s: %s complete" executable label))
+             (message "%s %s failed (exit %s); see *%s*"
+                      executable label (process-exit-status proc)
+                      executable))))))))
 
 ;;;###autoload
 (defun wit-ts-deps-sync ()
-  "Resolve WIT dependencies for the current project with `wit-deps'.
-Runs `wit-deps' (equivalent to `wit-deps lock'): it populates the
-dependency directory from the manifest, honouring the existing
-lock file without changing pinned versions.  To pull newer sources
-for dynamic references, use `wit-ts-deps-update' instead.
+  "Resolve WIT dependencies for the current project, honouring the lock file.
+Populates the dependency directory from the manifest without
+changing pinned versions.  The tool is chosen by
+`wit-ts-deps-tool-function': by default `wit-deps' (run bare, like
+`wit-deps lock') for a project with a `deps.toml', otherwise `wkg
+fetch'.  To pull newer sources for dynamic references, use
+`wit-ts-deps-update' instead.
 
 See `wit-ts-mode--deps-run' for the execution model and the errors
 this may signal."
   (interactive)
-  (wit-ts-mode--deps-run nil "sync"))
+  (wit-ts-mode--deps-run 'sync "sync"))
 
 ;;;###autoload
 (defun wit-ts-deps-update ()
-  "Update WIT dependencies for the current project with `wit-deps update'.
+  "Update WIT dependencies for the current project and rewrite the lock file.
 Unlike `wit-ts-deps-sync', this pulls the latest sources for
-dynamic references (such as a tracked branch) and rewrites the
-lock file.
+dynamic references (such as a tracked branch).  The tool is chosen
+by `wit-ts-deps-tool-function': by default `wit-deps update' for a
+project with a `deps.toml', otherwise `wkg update'.
 
 See `wit-ts-mode--deps-run' for the execution model and the errors
 this may signal."
   (interactive)
-  (wit-ts-mode--deps-run '("update") "update"))
+  (wit-ts-mode--deps-run 'update "update"))
 
-;;; Binding generation (wit-bindgen)
+;;; Binding / component generation
 
-(defvar wit-ts-mode--bindgen-args (make-hash-table :test 'equal)
-  "Session cache of `wit-bindgen' argument strings, keyed by project root.
-Populated by `wit-ts-bindgen' the first time it runs in a project
+(defvar wit-ts-mode--generate-args (make-hash-table :test 'equal)
+  "Session cache of generate argument strings, keyed by project root.
+Populated by `wit-ts-generate' the first time it runs in a project
 so later invocations reuse the same arguments.  Not persisted --
 it is forgotten when Emacs exits.")
 
 (defconst wit-ts-mode--bindgen-languages
   '("rust" "c" "cpp" "go" "csharp" "moonbit" "markdown")
   "Target languages `wit-bindgen' can generate bindings for.
-Used only to hint the `wit-ts-bindgen' prompt; the authoritative
-list is whatever the installed `wit-bindgen' supports.")
+Used only to hint the `wit-ts-generate' prompt for `wit-deps'
+projects; the authoritative list is whatever the installed
+`wit-bindgen' supports.")
 
-(defun wit-ts-mode--bindgen-default-args (project-root)
-  "Return a template `wit-bindgen' argument string for PROJECT-ROOT.
-Uses the project's WIT directory as the trailing path, e.g.
-\"rust --out-dir bindings wit\"."
-  (let* ((roots (wit-ts-mode--wit-root))
-         (wit-dir (if roots
-                      (directory-file-name
-                       (file-relative-name (car roots) project-root))
-                    wit-ts-deps-directory)))
-    (format "rust --out-dir bindings %s" wit-dir)))
+(defun wit-ts-mode--generate-plan (roots)
+  "Return the generate plan for the project described by ROOTS.
+ROOTS is a (WIT-ROOT . PROJECT-ROOT) cons as returned by
+`wit-ts-mode--wit-root'.  The tool is chosen by
+`wit-ts-deps-tool-function' (the same choice that drives
+`wit-ts-deps-sync'): `wit-bindgen' for a `wit-deps' project,
+`cargo-component' for a `wkg' one.
+
+The result is a plist with keys :executable (the program name),
+:exec-var (its custom variable, for error messages), :prompt (the
+minibuffer prompt), :default-args (the template argument string
+pre-filled on first use), and :root (the project root the process
+should run in).
+
+Signals a `user-error' when the tool function returns an unknown
+symbol."
+  (let ((tool (funcall wit-ts-deps-tool-function (car roots)))
+        (project-root (cdr roots)))
+    (pcase tool
+      ('wit-deps
+       (let ((wit-dir (directory-file-name
+                       (file-relative-name (car roots) project-root))))
+         (list :executable wit-ts-bindgen-executable
+               :exec-var 'wit-ts-bindgen-executable
+               :prompt (format
+                        "wit-bindgen args (LANGUAGE [OPTIONS] WIT-PATH; e.g. %s): "
+                        (string-join wit-ts-mode--bindgen-languages ", "))
+               :default-args (format "rust --out-dir bindings %s" wit-dir)
+               :root project-root)))
+      ('wkg
+       (list :executable wit-ts-cargo-component-executable
+             :exec-var 'wit-ts-cargo-component-executable
+             :prompt "cargo-component args (e.g. build): "
+             :default-args "build"
+             :root project-root))
+      (_ (user-error "`wit-ts-deps-tool-function' returned unknown tool `%S'"
+                     tool)))))
 
 ;;;###autoload
-(defun wit-ts-bindgen (&optional reconfigure)
-  "Generate language bindings for the current project with `wit-bindgen'.
-Prompts for the arguments to pass after `wit-bindgen', in the form
-LANGUAGE [OPTIONS] WIT-PATH (e.g. \"rust --out-dir bindings wit\").
-On the first run the prompt is pre-filled with a template using the
-project's WIT directory; just edit it and confirm.  The program is
-then run asynchronously from the project root, streaming output to
-the `*wit-bindgen*' buffer.
+(defun wit-ts-generate (&optional reconfigure)
+  "Generate bindings or build a component for the current project.
+The tool matches the one that resolves dependencies (see
+`wit-ts-deps-tool-function'): `wit-bindgen' for a `wit-deps'
+project, or `cargo-component build' for a `wkg' one.
+
+Prompts for the arguments to pass to the chosen program.  On the
+first run the prompt is pre-filled with a tool-appropriate template
+\(for `wit-bindgen', LANGUAGE [OPTIONS] WIT-PATH using the project's
+WIT directory; for `cargo-component', \"build\"); just edit it and
+confirm.  The program then runs asynchronously from the project
+root, streaming output to a buffer named for the executable.
 
 The arguments are remembered per project for the rest of the Emacs
 session, so later invocations reuse them without prompting.  With a
 prefix argument RECONFIGURE, prompt again (pre-filled with the last
 arguments) and store the new value.
 
-Signals a `user-error' if the executable is not found or the buffer
-is not part of a `wit-deps' project (no DIR/deps.toml)."
+Signals a `user-error' if the buffer is not under a
+`wit-ts-deps-directory' or the chosen executable is not found."
   (interactive "P")
-  (unless (executable-find wit-ts-bindgen-executable)
-    (user-error "Cannot find `%s' on `exec-path'; set `wit-ts-bindgen-executable'"
-                wit-ts-bindgen-executable))
   (let ((roots (wit-ts-mode--wit-root)))
     (unless roots
-      (user-error "No `%s/deps.toml' found for this buffer"
+      (user-error "No `%s' directory found for this buffer"
                   wit-ts-deps-directory))
-    (let* ((project-root (cdr roots))
-           (remembered (gethash project-root wit-ts-mode--bindgen-args))
-           ;; On the first run, pre-fill a template using the project's WIT
-           ;; dir; afterwards, pre-fill the remembered arguments.
-           (initial (or remembered
-                        (wit-ts-mode--bindgen-default-args project-root)))
-           (args-string
-            (if (and remembered (not reconfigure))
-                remembered
-              (read-string
-               ;; The prompt names the expected form; the hint lists the
-               ;; target languages `wit-bindgen' understands.
-               (format "wit-bindgen args (LANGUAGE [OPTIONS] WIT-PATH; e.g. %s): "
-                       (string-join wit-ts-mode--bindgen-languages ", "))
-               initial)))
-           (args (split-string-and-unquote args-string)))
-      (when (null args)
-        (user-error "No `%s' arguments given" wit-ts-bindgen-executable))
-      (puthash project-root args-string wit-ts-mode--bindgen-args)
-      (wit-ts-mode--bindgen-run project-root args))))
+    (let* ((plan (wit-ts-mode--generate-plan roots))
+           (executable (plist-get plan :executable))
+           (project-root (plist-get plan :root)))
+      (unless (executable-find executable)
+        (user-error "Cannot find `%s' on `exec-path'; set `%s'"
+                    executable (plist-get plan :exec-var)))
+      (let* ((remembered (gethash project-root wit-ts-mode--generate-args))
+             ;; On the first run, pre-fill the tool's template; afterwards,
+             ;; pre-fill the remembered arguments.
+             (initial (or remembered (plist-get plan :default-args)))
+             (args-string
+              (if (and remembered (not reconfigure))
+                  remembered
+                (read-string (plist-get plan :prompt) initial)))
+             (args (split-string-and-unquote args-string)))
+        (when (null args)
+          (user-error "No `%s' arguments given" executable))
+        (puthash project-root args-string wit-ts-mode--generate-args)
+        (wit-ts-mode--generate-run executable project-root args)))))
 
-(defun wit-ts-mode--bindgen-run (project-root args)
-  "Run `wit-ts-bindgen-executable' with ARGS from PROJECT-ROOT, asynchronously.
-Streams output to the `*wit-bindgen*' buffer, whose first line
-shows the exact command being run.  ARGS is a list of already-split
+(defun wit-ts-mode--generate-run (executable project-root args)
+  "Run EXECUTABLE with ARGS from PROJECT-ROOT, asynchronously.
+Streams output to a `*EXECUTABLE*' buffer, whose first line shows
+the exact command being run.  ARGS is a list of already-split
 command-line arguments."
   (let* ((default-directory project-root)
-         (command (cons wit-ts-bindgen-executable args))
+         (command (cons executable args))
          (command-line (mapconcat #'shell-quote-argument command " "))
-         (buffer (get-buffer-create "*wit-bindgen*")))
+         (buffer (get-buffer-create (format "*%s*" executable))))
     (with-current-buffer buffer
       (setq buffer-read-only nil)
       (erase-buffer)
@@ -875,7 +983,7 @@ command-line arguments."
     (display-buffer buffer)
     (message "Running: %s" command-line)
     (make-process
-     :name "wit-bindgen"
+     :name executable
      :buffer buffer
      :command command
      :noquery t
@@ -884,9 +992,9 @@ command-line arguments."
        (when (memq (process-status proc) '(exit signal))
          (if (and (eq (process-status proc) 'exit)
                   (zerop (process-exit-status proc)))
-             (message "wit-bindgen: bindings generated")
-           (message "wit-bindgen failed (exit %s); see *wit-bindgen*"
-                    (process-exit-status proc))))))))
+             (message "%s: complete" executable)
+           (message "%s failed (exit %s); see *%s*"
+                    executable (process-exit-status proc) executable)))))))
 
 (defun wit-ts-mode--in-comment-or-string-p (node)
   "Return non-nil if NODE is, or is inside, a comment or string."
@@ -1503,13 +1611,14 @@ list, e.g. `%s.{name}'; a bare `use %s;' is only valid at file top level"
      (t
       (format "Syntax error: unexpected `%s'" (wit-ts-mode--snippet node))))))
 
-(defun wit-ts-mode--flymake-diag (source node message)
-  "Make a Flymake error diagnostic for NODE in SOURCE with MESSAGE.
-Zero-width nodes are widened by one character so there is
-something to underline."
+(defun wit-ts-mode--flymake-diag (source node message &optional type)
+  "Make a Flymake diagnostic for NODE in SOURCE with MESSAGE.
+TYPE is the severity (default `:error'; semantic reference checks
+use `:warning').  Zero-width nodes are widened by one character so
+there is something to underline."
   (let* ((beg (treesit-node-start node))
          (end (max (treesit-node-end node) (1+ beg))))
-    (flymake-make-diagnostic source beg end :error message)))
+    (flymake-make-diagnostic source beg end (or type :error) message)))
 
 (defun wit-ts-mode--empty-use-names-positions (root)
   "Return the set of buffer positions of empty `use' names lists under ROOT.
@@ -1559,14 +1668,230 @@ e.g. `use path.{errno}'"
      t)
     (nreverse diags)))
 
+;;; Semantic reference checking
+
+;; Beyond parse errors, verify that identifiers used in import/export/use
+;; paths actually resolve: the interface must exist (locally, or in the
+;; referenced package under DIR/deps/), and a `use PATH.{ ... }' list may only
+;; name members that interface defines.  This is a spec-guided heuristic, not a
+;; full resolver, so unresolved references are reported as warnings.
+
+(defun wit-ts-mode--project-package-index ()
+  "Return an index of the project's packages, or nil outside a project.
+The index is an alist mapping each package id to an alist of its
+interfaces, mapping interface name to its member (type/resource)
+names.  The current buffer is read live (honouring unsaved edits);
+other files come from the mtime-cached `wit-ts-mode--parse-file'.
+Definitions for one package may be spread across several files, so
+per-package interface alists are merged."
+  (when-let* ((roots (wit-ts-mode--wit-root))
+              (wit-root (car roots)))
+    (let ((index (make-hash-table :test 'equal))
+          (self (and buffer-file-name (expand-file-name buffer-file-name))))
+      (cl-flet ((add (pkg ifaces)
+                  (when pkg
+                    (setf (gethash pkg index)
+                          (append ifaces (gethash pkg index))))))
+        ;; Current buffer, live.
+        (when-let* ((parser (wit-ts-mode--parser)))
+          (add (wit-ts-mode--buffer-package-id)
+               (wit-ts-mode--interface-members-alist
+                (treesit-parser-root-node parser))))
+        ;; Every other file under the wit-deps root.
+        (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
+          (unless (equal (expand-file-name file) self)
+            (let ((info (wit-ts-mode--parse-file file)))
+              (add (plist-get info :package) (plist-get info :members))))))
+      ;; Materialise as an alist so callers can `assoc' packages/interfaces.
+      (let (result)
+        (maphash (lambda (pkg ifaces) (push (cons pkg ifaces) result)) index)
+        result))))
+
+(defun wit-ts-mode--reference-diagnostic (source path-node index)
+  "Return a warning diagnostic for the use_path PATH-NODE, or nil.
+Resolves the path against INDEX (see
+`wit-ts-mode--project-package-index'): warns when the referenced
+package is absent, or the interface is not defined in it (or, for a
+bare local path, not defined in the current package).  Members of a
+`use PATH.{ ... }' list are checked separately.  SOURCE is the
+buffer the diagnostic is anchored in."
+  (let* ((path (treesit-node-text path-node t))
+         (split (wit-ts-mode--split-use-path path))
+         (package (car split))
+         (interface (cdr split))
+         (own-pkg (wit-ts-mode--buffer-package-id))
+         ;; A bare path resolves within the current package.
+         (target-pkg (or package own-pkg))
+         (pkg-entry (and target-pkg (assoc target-pkg index))))
+    (cond
+     ;; Foreign package not present anywhere in the project (e.g. deps not
+     ;; fetched, or a typo'd package id).
+     ((and package (not pkg-entry))
+      (wit-ts-mode--flymake-diag
+       source path-node
+       (format "Unknown package `%s' (run `%s' to fetch dependencies?)"
+               package wit-ts-deps-executable)
+       :warning))
+     ;; Package known but the interface is not defined in it.
+     ((and pkg-entry (not (assoc interface (cdr pkg-entry))))
+      (wit-ts-mode--flymake-diag
+       source path-node
+       (if package
+           (format "Interface `%s' is not defined in package `%s'"
+                   interface package)
+         (format "Interface `%s' is not defined in this package" interface))
+       :warning)))))
+
+(defun wit-ts-mode--use-names-item-name-node (item)
+  "Return the id node naming the member imported by a `use_names_item' ITEM.
+For a plain `foo' it is the id; for an alias `foo as bar' it is the
+`path' field of the `alias_item' (the imported name, not the local
+alias).  Return nil if none is found."
+  (let ((child (treesit-node-child item 0 t)))
+    (cond
+     ((null child) nil)
+     ((equal (treesit-node-type child) "alias_item")
+      (treesit-node-child-by-field-name child "path"))
+     ((equal (treesit-node-type child) "id") child)
+     (t nil))))
+
+(defun wit-ts-mode--member-diagnostics (source use-item index)
+  "Return warning diagnostics for undefined members in a USE-ITEM.
+USE-ITEM is a `use_item' node (a `use PATH.{ ... }' statement).
+Each listed member is checked against the members INDEX reports for
+the referenced interface.  When the interface itself is unresolved,
+no member diagnostics are produced (the path diagnostic covers it).
+SOURCE is the buffer the diagnostics are anchored in."
+  (when-let* ((path-node (car (treesit-query-capture
+                               use-item '((use_path) @p) nil nil t)))
+              (split (wit-ts-mode--split-use-path
+                      (treesit-node-text path-node t)))
+              (target-pkg (or (car split) (wit-ts-mode--buffer-package-id)))
+              (pkg-entry (assoc target-pkg index))
+              (iface-entry (assoc (cdr split) (cdr pkg-entry)))
+              ;; Members are kinded strings; compare by plain text.
+              (members (mapcar #'substring-no-properties (cdr iface-entry))))
+    (let (diags)
+      (dolist (item (treesit-query-capture
+                     use-item '((use_names_item) @i) nil nil t))
+        (when-let* ((name-node (wit-ts-mode--use-names-item-name-node item))
+                    (name (treesit-node-text name-node t)))
+          (unless (or (string-empty-p name) (member name members))
+            (push (wit-ts-mode--flymake-diag
+                   source name-node
+                   (format "`%s' is not defined in interface `%s'"
+                           name (cdr split))
+                   :warning)
+                  diags))))
+      (nreverse diags))))
+
+(defconst wit-ts-mode--type-def-query
+  '((type_item alias: (id) @t)
+    (record_item name: (id) @t)
+    (variant_items name: (id) @t)
+    (enum_items name: (id) @t)
+    (flags_items name: (id) @t)
+    (resource_item name: (id) @t))
+  "Tree-sitter query capturing the names of type definitions.
+These are the names a type reference (e.g. a function parameter
+type) may resolve to within the buffer.")
+
+(defun wit-ts-mode--in-scope-type-names (root)
+  "Return the type names in scope under ROOT, as a hash-table set.
+Comprises the builtin types, every type/resource defined in the
+buffer, and the local name bound by each `use PATH.{ ... }' item
+\(its alias when one is given).  Used to decide whether a type
+reference resolves; membership is by plain name."
+  (let ((names (make-hash-table :test 'equal)))
+    (dolist (builtin wit-ts-mode--builtin-types)
+      (puthash builtin t names))
+    (dolist (node (treesit-query-capture root wit-ts-mode--type-def-query
+                                         nil nil t))
+      (puthash (treesit-node-text node t) t names))
+    ;; `use'-bound local names: the alias if present, else the imported id.
+    (dolist (item (treesit-query-capture root '((use_names_item) @i) nil nil t))
+      (when-let* ((child (treesit-node-child item 0 t))
+                  (name (pcase (treesit-node-type child)
+                          ("alias_item"
+                           (treesit-node-child-by-field-name child "alias"))
+                          ("id" child))))
+        (puthash (treesit-node-text name t) t names)))
+    names))
+
+(defun wit-ts-mode--type-ref-diagnostics (source root)
+  "Return warnings for unknown type references anywhere under ROOT.
+Every named type reference -- a function parameter or return type,
+a `type' alias's target, a record field, a variant payload, an
+element of a `list'/`option'/`result'/`tuple', a `borrow'/`own'
+handle, and so on -- is checked against the names in scope (see
+`wit-ts-mode--in-scope-type-names'); one that is neither a builtin,
+a locally-defined type, nor a `use'-imported name is flagged.
+Builtin types parse as keywords (not identifiers), so they are
+never considered.  SOURCE is the buffer the diagnostics are
+anchored in."
+  (let ((in-scope (wit-ts-mode--in-scope-type-names root))
+        diags)
+    ;; A named type reference is `(ty (id))' regardless of where it
+    ;; appears; a `borrow'/`own' handle is `(handle (id))'.  Nested
+    ;; generics recurse into inner `ty' nodes, so e.g. `list<foo>' and
+    ;; `result<ok, err>' surface `foo'/`ok'/`err'.  Definition and field
+    ;; *names* are not `(ty (id))', nor are `use_path' segments, so they
+    ;; are never caught.
+    (dolist (id (treesit-query-capture
+                 root '((ty (id) @t) (handle (id) @t)) nil nil t))
+      (let ((name (treesit-node-text id t)))
+        (unless (gethash name in-scope)
+          (push (wit-ts-mode--flymake-diag
+                 source id (format "Unknown type `%s'" name) :warning)
+                diags))))
+    (nreverse diags)))
+
+(defun wit-ts-mode--reference-diagnostics (parser source)
+  "Return semantic reference warnings for the buffer of PARSER.
+Checks that every type reference (in a `type' alias, record field,
+variant payload, function signature, and so on) resolves to a
+builtin, a locally-defined type, or a `use'-imported name.
+Additionally, in a `wit-deps' project, checks every `use_path'
+\(interface reference) and every `use PATH.{ ... }' member list
+against the project package index.  Diagnostics are anchored in the
+SOURCE buffer."
+  (when-let* ((root (treesit-parser-root-node parser)))
+    ;; Type references are checked in-buffer, so this runs even outside a
+    ;; project, where the package index (and thus `use_path' checking) is
+    ;; unavailable.
+    (let ((index (wit-ts-mode--project-package-index))
+          (diags (wit-ts-mode--type-ref-diagnostics source root)))
+      (when index
+        ;; Interface-path references.
+        (dolist (path-node (treesit-query-capture
+                            root '((use_path) @p) nil nil t))
+          (when-let* ((diag (wit-ts-mode--reference-diagnostic
+                             source path-node index)))
+            (push diag diags)))
+        ;; Names-list members (only `use_item' has a `.{ ... }' list).
+        (dolist (use-item (treesit-query-capture
+                           root '((use_item) @u) nil nil t))
+          (setq diags
+                (nconc (wit-ts-mode--member-diagnostics
+                        source use-item index)
+                       diags))))
+      diags)))
+
 (defun wit-ts-mode-flymake (report-fn &rest _args)
-  "A Flymake backend reporting WIT tree-sitter parse errors.
-REPORT-FN is called with the diagnostics, per the Flymake backend
-protocol.  Intended for `flymake-diagnostic-functions'."
+  "A Flymake backend reporting WIT tree-sitter diagnostics.
+Reports parse errors (from ERROR/MISSING nodes) and, when
+`wit-ts-mode-check-references' is non-nil, semantic warnings for
+unresolved `import'/`export'/`use' references.  REPORT-FN is
+called with the diagnostics, per the Flymake backend protocol.
+Intended for `flymake-diagnostic-functions'."
   (if-let* ((parser (or wit-ts-mode--flymake-parser
                         (wit-ts-mode--parser))))
-      (funcall report-fn
-               (wit-ts-mode--flymake-diagnostics parser (current-buffer)))
+      (let ((source (current-buffer)))
+        (funcall report-fn
+                 (append
+                  (wit-ts-mode--flymake-diagnostics parser source)
+                  (and wit-ts-mode-check-references
+                       (wit-ts-mode--reference-diagnostics parser source)))))
     (funcall report-fn nil)))
 
 ;;; Mode definition
@@ -1577,7 +1902,7 @@ Project-tool commands live under the major-mode-reserved
 `C-c C-<letter>' space."
   "C-c C-d" #'wit-ts-deps-sync
   "C-c C-u" #'wit-ts-deps-update
-  "C-c C-b" #'wit-ts-bindgen)
+  "C-c C-b" #'wit-ts-generate)
 
 ;;;###autoload
 (define-derived-mode wit-ts-mode prog-mode "WIT"
@@ -1606,29 +1931,35 @@ Features:
 Dependencies:
 
 Cross-file and cross-package completion resolves symbols from the
-sources that `wit-deps' fetches under the project's dependency
-directory (see `wit-ts-deps-directory').  Manage them with:
+sources fetched under the project's dependency directory (see
+`wit-ts-deps-directory').  Manage them with:
 
 \\[wit-ts-deps-sync]
     Resolve dependencies from the manifest, honouring the lock
-    file (like `wit-deps lock').
+    file.
 \\[wit-ts-deps-update]
     Pull newer sources for dynamic references and rewrite the lock
-    file (like `wit-deps update').
+    file.
 
-Both run the `wit-ts-deps-executable' program asynchronously.
+Both run asynchronously and populate the same dependency
+directory.  The tool is chosen by `wit-ts-deps-tool-function':
+by default `wit-deps' for a project with a `deps.toml' manifest
+and `wkg' (wasm-pkg-tools) otherwise.
 
 Files under that dependency directory are fetched artifacts, so
 they are visited read-only (see `wit-ts-mode-deps-read-only').
 
-Bindings:
+Generation:
 
-\\[wit-ts-bindgen]
-    Generate language bindings from the project's WIT with
-    `wit-bindgen'.  Prompts for the arguments (e.g. \"rust --out-dir
-    gen wit\"), then remembers them per project for the session; a
-    prefix argument re-prompts.  The exact command is shown in the
-    `*wit-bindgen*' buffer and the echo area.
+\\[wit-ts-generate]
+    Generate bindings or build a component, using the tool that
+    matches the project (see `wit-ts-deps-tool-function'):
+    `wit-bindgen' for a `wit-deps' project or `cargo-component
+    build' for a `wkg' one.  Prompts for the arguments (pre-filled
+    with a tool-appropriate template), then remembers them per
+    project for the session; a prefix argument re-prompts.  The
+    exact command is shown in the tool's output buffer and the echo
+    area.
 
 \\{wit-ts-mode-map}"
   :group 'wit-ts
