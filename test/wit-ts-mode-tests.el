@@ -175,6 +175,80 @@ Skips the test if the WIT grammar is not ready."
                                  (flymake-diagnostic-text d)))
                diags)))))
 
+(defun wit-ts-mode-tests--diagnostic-texts (content)
+  "Return the Flymake diagnostic messages for CONTENT in `wit-ts-mode'."
+  (with-temp-buffer
+    (insert content)
+    (wit-ts-mode)
+    (mapcar #'flymake-diagnostic-text (wit-ts-mode-tests--diagnostics))))
+
+(ert-deftest wit-ts-mode-flymake-use-without-names-list ()
+  "A bare `use path;' inside an interface/world is explained clearly."
+  (skip-unless (treesit-ready-p 'wit t))
+  (dolist (content '("interface i {\n  use foo;\n}\n"
+                     "world w {\n  use wasi:clocks/x;\n}\n"))
+    (let ((texts (wit-ts-mode-tests--diagnostic-texts content)))
+      (should (seq-some (lambda (m) (string-match-p "needs a `.{\\.\\.\\.}' names list" m))
+                        texts)))))
+
+(ert-deftest wit-ts-mode-flymake-empty-use-names-list ()
+  "An empty `use path.{}' names list gets a tailored message."
+  (skip-unless (treesit-ready-p 'wit t))
+  (dolist (content '("interface i {\n  use foo.{};\n}\n"
+                     "interface i {\n  use foo.{ };\n}\n"))
+    (let ((texts (wit-ts-mode-tests--diagnostic-texts content)))
+      (should (seq-some (lambda (m) (string-match-p "Empty `use' names list" m))
+                        texts)))))
+
+(ert-deftest wit-ts-mode-flymake-valid-use-forms-clean ()
+  "Valid `use' forms produce no diagnostics."
+  (skip-unless (treesit-ready-p 'wit t))
+  ;; Names list inside an interface, and a bare `use' at file top level.
+  (should-not (wit-ts-mode-tests--diagnostic-texts
+               "interface i {\n  use foo.{a, b};\n}\n"))
+  (should-not (wit-ts-mode-tests--diagnostic-texts
+               "use wasi:clocks/monotonic-clock@0.2.10;\n")))
+
+(ert-deftest wit-ts-mode-flymake-import-at-top-level ()
+  "`import'/`export'/`include' at file scope are flagged as world-only."
+  (skip-unless (treesit-ready-p 'wit t))
+  (dolist (case '(("import foo;\n" . "`import' is only valid inside a `world'")
+                  ("export wasi:http/handler;\n"
+                   . "`export' is only valid inside a `world'")
+                  ("include other;\n"
+                   . "`include' is only valid inside a `world'")))
+    (let ((texts (wit-ts-mode-tests--diagnostic-texts (car case))))
+      (should (seq-some (lambda (m) (string-search (cdr case) m)) texts)))))
+
+(ert-deftest wit-ts-mode-flymake-inline-import-missing-type ()
+  "An inline `import NAME:' with no type after the colon is explained."
+  (skip-unless (treesit-ready-p 'wit t))
+  (dolist (content '("world w {\n  import foo:\n}\n"
+                     "world w {\n  export bar: \n}\n"))
+    (let ((texts (wit-ts-mode-tests--diagnostic-texts content)))
+      (should (seq-some
+               (lambda (m) (string-search "must be followed by a type" m))
+               texts)))))
+
+(ert-deftest wit-ts-mode-flymake-import-missing-name ()
+  "An `import: ...' with no name before the colon is explained."
+  (skip-unless (treesit-ready-p 'wit t))
+  (let ((texts (wit-ts-mode-tests--diagnostic-texts
+                "world w {\n  import: bar;\n}\n")))
+    (should (seq-some
+             (lambda (m) (string-search "needs a name before `:'" m))
+             texts))))
+
+(ert-deftest wit-ts-mode-flymake-valid-import-forms-clean ()
+  "Valid `import' forms inside a world produce no diagnostics."
+  (skip-unless (treesit-ready-p 'wit t))
+  (should-not (wit-ts-mode-tests--diagnostic-texts
+               "world w {\n  import wasi:http/handler@0.2.0;\n}\n"))
+  (should-not (wit-ts-mode-tests--diagnostic-texts
+               "world w {\n  import foo: func();\n}\n"))
+  (should-not (wit-ts-mode-tests--diagnostic-texts
+               "world w {\n  import foo: interface { f: func(); }\n}\n")))
+
 ;;; Folding
 
 (ert-deftest wit-ts-mode-hideshow-folds-blocks ()
@@ -314,39 +388,245 @@ tree.  Skips the test if the WIT grammar is not ready."
       (should (equal (expand-file-name wit-root)
                      (expand-file-name "wit/" project-root))))))
 
-(ert-deftest wit-ts-mode-file-definitions-parses-dep ()
-  "`wit-ts-mode--file-definitions' returns names from an off-buffer file."
+(ert-deftest wit-ts-mode-parse-file-extracts-package-and-interfaces ()
+  "`wit-ts-mode--parse-file' returns the package id, version, and interfaces."
   (skip-unless (treesit-ready-p 'wit t))
   (let* ((dep (ert-resource-file "proj/wit/deps/dep/dep.wit"))
-         (names (wit-ts-mode--file-definitions dep)))
-    (should (member "dep-iface" names))
-    (should (member "widget" names))
-    (should (member "gadget" names))))
+         (info (wit-ts-mode--parse-file dep)))
+    (should (equal (plist-get info :package) "example:dep"))
+    (should (equal (plist-get info :version) "0.1.0"))
+    ;; Interfaces/worlds are captured; nested records are not.
+    (should (member "dep-iface" (plist-get info :interfaces)))
+    (should-not (member "widget" (plist-get info :interfaces)))
+    ;; Members are indexed per interface: `widget' (a record) but not the
+    ;; `gadget' function.
+    (let ((members (cdr (assoc "dep-iface" (plist-get info :members)))))
+      (should (member "widget" members))
+      (should-not (member "gadget" members)))))
 
-(ert-deftest wit-ts-mode-external-definitions-included-in-completion ()
-  "Completion candidates include symbols defined only in a dep file."
+(ert-deftest wit-ts-mode-package-id-reconstruction ()
+  "`wit-ts-mode--package-id-from-decl-head' rebuilds ids, dropping @version."
+  (skip-unless (treesit-ready-p 'wit t))
+  (dolist (case '(("package wasi:http@0.2.10;" . "wasi:http")
+                  ("package examples:http;" . "examples:http")
+                  ("package foo:bar/baz@1.0.0;" . "foo:bar/baz")))
+    (with-temp-buffer
+      (insert (car case) "\n")
+      (let* ((parser (treesit-parser-create 'wit))
+             (head (car (treesit-query-capture
+                         (treesit-parser-root-node parser)
+                         wit-ts-mode--completion-packages-query nil nil t))))
+        (should (equal (wit-ts-mode--package-id-from-decl-head head)
+                       (cdr case)))))))
+
+(ert-deftest wit-ts-mode-general-completion-excludes-foreign-names ()
+  "Ordinary completion offers buffer defs but not other packages' symbols."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
     (let ((cands (wit-ts-mode--completion-candidates)))
       ;; Defined in the current buffer.
       (should (member "app" cands))
-      ;; Defined only under wit/deps/.
-      (should (member "widget" cands))
-      (should (member "gadget" cands)))))
+      ;; Defined only under wit/deps/ (a foreign package) -- must NOT leak
+      ;; into ordinary completion.
+      (should-not (member "widget" cands))
+      (should-not (member "gadget" cands))
+      (should-not (member "dep-iface" cands)))))
 
-(ert-deftest wit-ts-mode-external-definitions-excludes-self ()
-  "The current buffer's own file is not re-scanned as an external file."
+(ert-deftest wit-ts-mode-path-candidates-local-and-foreign ()
+  "Path candidates mix bare local names with foreign ns:pkg/iface@version."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((cands (wit-ts-mode--path-candidates)))
+      ;; Current buffer's own interface -- bare local name.
+      (should (member "app" cands))
+      ;; Sibling file sharing package example:root -- bare local name.
+      (should (member "sibling-iface" cands))
+      ;; Foreign package -- full path with version, not a bare name.
+      (should (member "example:dep/dep-iface@0.1.0" cands))
+      (should-not (member "dep-iface" cands)))))
+
+(ert-deftest wit-ts-mode-path-candidates-nil-without-project ()
+  "`wit-ts-mode--path-candidates' returns nil outside a wit-deps project."
   (skip-unless (treesit-ready-p 'wit t))
-  ;; A file not inside any wit-deps project yields no external defs.
   (with-temp-buffer
     (insert "package a:b;\ninterface solo { type t = u32; }\n")
     (setq buffer-file-name (make-temp-file "wit-solo" nil ".wit"))
     (unwind-protect
         (progn
           (wit-ts-mode)
-          (should-not (wit-ts-mode--external-definitions)))
+          (should-not (wit-ts-mode--path-candidates)))
       (ignore-errors (delete-file buffer-file-name))
       (set-buffer-modified-p nil)
       (setq buffer-file-name nil))))
+
+(ert-deftest wit-ts-mode-import-context-uses-path-candidates ()
+  "The capf switches to path candidates after `import'."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  import ")
+    (should (wit-ts-mode--in-use-path-p))
+    (let* ((capf (wit-ts-mode-completion-at-point))
+           (cands (all-completions "" (nth 2 capf))))
+      (should (member "example:dep/dep-iface@0.1.0" cands))
+      (should (member "sibling-iface" cands))
+      ;; Keywords are not offered in a use_path position.
+      (should-not (member "interface" cands)))))
+
+(ert-deftest wit-ts-mode-non-import-context-uses-default-candidates ()
+  "Outside an import path the capf offers keywords, not foreign paths."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\ninterface bar {\n  type x = ")
+    (should-not (wit-ts-mode--in-use-path-p))
+    (let* ((capf (wit-ts-mode-completion-at-point))
+           (cands (all-completions "" (nth 2 capf))))
+      (should (member "u32" cands))
+      (should-not (member "example:dep/dep-iface@0.1.0" cands)))))
+
+(ert-deftest wit-ts-mode-import-context-detected-with-colon-prefix ()
+  "A partial package path with `:'/`/' still counts as a use_path.
+Regression: the context regexp must not stop at the `:' separator,
+and the completion bounds must include it so the path filters."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  import example:d")
+    (should (wit-ts-mode--in-use-path-p))
+    (let* ((capf (wit-ts-mode-completion-at-point))
+           (prefix (buffer-substring-no-properties (nth 0 capf) (nth 1 capf)))
+           (matches (all-completions prefix (nth 2 capf))))
+      (should (equal prefix "example:d"))
+      (should (member "example:dep/dep-iface@0.1.0" matches)))))
+
+(ert-deftest wit-ts-mode-inline-import-is-not-use-path ()
+  "`import NAME: extern-type' (space after `:') is not a use_path."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  import my-thing: ")
+    (should-not (wit-ts-mode--in-use-path-p))))
+
+(ert-deftest wit-ts-mode-completion-candidates-are-sorted ()
+  "The completion table returns candidates in alphabetical order and
+advertises `identity' as its display sort so frontends preserve it."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  import ")
+    (let* ((table (nth 2 (wit-ts-mode-completion-at-point)))
+           (cands (all-completions "" table))
+           (md (completion-metadata "" table nil)))
+      (should (equal cands (sort (copy-sequence cands) #'string<)))
+      (should (eq (completion-metadata-get md 'display-sort-function)
+                  'identity)))))
+
+(defun wit-ts-mode-tests--find-candidate (prefix table)
+  "Return the completion from TABLE that is `equal' to PREFIX, with props."
+  (seq-find (lambda (c) (equal c prefix)) (all-completions prefix table)))
+
+(ert-deftest wit-ts-mode-candidates-carry-kind ()
+  "Buffer definitions, keywords, and builtins are tagged with their kind."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\n"
+            "interface things {\n  type dist = u32;\n  record pt { x: u32 }\n"
+            "  go: func();\n}\nworld srv {}\n")
+    (wit-ts-mode)
+    (let ((cands (wit-ts-mode--completion-candidates)))
+      (cl-flet ((kind-of (name)
+                  (wit-ts-mode--candidate-kind
+                   (seq-find (lambda (c) (equal c name)) cands))))
+        (should (eq (kind-of "things") 'interface))
+        (should (eq (kind-of "srv") 'world))
+        (should (eq (kind-of "pt") 'record))
+        (should (eq (kind-of "dist") 'type))
+        (should (eq (kind-of "go") 'func))
+        (should (eq (kind-of "interface") 'keyword))
+        (should (eq (kind-of "u32") 'builtin))))))
+
+(ert-deftest wit-ts-mode-capf-exposes-kind-functions ()
+  "The capf provides annotation and company-kind functions using the kind."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface things {}\ninterface z {\n  ")
+    (wit-ts-mode)
+    (let* ((capf (wit-ts-mode-completion-at-point))
+           (props (nthcdr 3 capf))
+           (annfn (plist-get props :annotation-function))
+           (kindfn (plist-get props :company-kind))
+           (cand (wit-ts-mode-tests--find-candidate "things" (nth 2 capf))))
+      (should (functionp annfn))
+      (should (functionp kindfn))
+      (should (equal (funcall annfn cand) " interface"))
+      (should (eq (funcall kindfn cand) 'interface)))))
+
+(ert-deftest wit-ts-mode-foreign-path-candidate-keeps-kind ()
+  "A foreign ns:pkg/iface path candidate keeps the interface's kind."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((cand (seq-find
+                 (lambda (c) (equal c "example:dep/dep-iface@0.1.0"))
+                 (wit-ts-mode--path-candidates))))
+      (should cand)
+      (should (eq (wit-ts-mode--candidate-kind cand) 'interface)))))
+
+;;; use names list (`use PATH.{ ... }')
+
+(ert-deftest wit-ts-mode-use-names-list-context-detection ()
+  "`use PATH.{' is detected as a names list; other braces are not."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (wit-ts-mode)
+    (insert "interface i {\n  use types.{")
+    (should (wit-ts-mode--in-use-names-list-p))
+    (should (equal (wit-ts-mode--current-use-path) "types")))
+  (with-temp-buffer
+    (wit-ts-mode)
+    ;; A record body brace is not a use names list.
+    (insert "interface i {\n  record r { ")
+    (should-not (wit-ts-mode--in-use-names-list-p))))
+
+(ert-deftest wit-ts-mode-split-use-path ()
+  "`wit-ts-mode--split-use-path' separates package id from interface."
+  (should (equal (wit-ts-mode--split-use-path "wasi:clocks/wall-clock@0.2.10")
+                 '("wasi:clocks" . "wall-clock")))
+  (should (equal (wit-ts-mode--split-use-path "wasi:clocks/wall-clock")
+                 '("wasi:clocks" . "wall-clock")))
+  (should (equal (wit-ts-mode--split-use-path "types")
+                 '(nil . "types"))))
+
+(ert-deftest wit-ts-mode-member-candidates-foreign-types-only ()
+  "Members of a foreign interface are offered; its functions are not."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\ninterface i {\n  use example:dep/dep-iface@0.1.0.{")
+    (should (wit-ts-mode--in-use-names-list-p))
+    (let ((cands (all-completions "" (nth 2 (wit-ts-mode-completion-at-point)))))
+      ;; `widget' is a record (a type); `gadget' is a func and must not appear.
+      (should (member "widget" cands))
+      (should-not (member "gadget" cands)))))
+
+(ert-deftest wit-ts-mode-member-candidates-sibling-interface ()
+  "A sibling file's interface members resolve for an unqualified `use'."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\ninterface i {\n  use sibling-iface.{")
+    (let ((cands (all-completions "" (nth 2 (wit-ts-mode-completion-at-point)))))
+      (should (member "timestamp" cands)))))
+
+(ert-deftest wit-ts-mode-member-candidates-exclude-already-listed ()
+  "Members already present in the brace list are not offered again."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    ;; Local interface `app' has no types; use a buffer-local interface with
+    ;; two types so the exclusion is observable.
+    (insert "\ninterface pair {\n  type a = u32;\n  type b = u32;\n}\n")
+    (insert "interface i {\n  use pair.{a, ")
+    (let ((cands (all-completions "" (nth 2 (wit-ts-mode-completion-at-point)))))
+      (should (member "b" cands))
+      (should-not (member "a" cands)))))
+
+(ert-deftest wit-ts-mode-member-candidates-nil-for-unknown-interface ()
+  "An unresolvable `use' path yields no member candidates."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\ninterface i {\n  use nonesuch.{")
+    (should (wit-ts-mode--in-use-names-list-p))
+    (should-not (wit-ts-mode--member-candidates))))
 
 ;;; Dependency synchronisation
 
