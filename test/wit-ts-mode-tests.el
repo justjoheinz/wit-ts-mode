@@ -564,6 +564,52 @@ advertises `identity' as its display sort so frontends preserve it."
       (should cand)
       (should (eq (wit-ts-mode--candidate-kind cand) 'interface)))))
 
+;;; Feature gates (@since / @unstable / @deprecated)
+
+(defun wit-ts-mode-tests--capf-candidates (content)
+  "Insert CONTENT in a `wit-ts-mode' buffer and return capf candidates at end."
+  (with-temp-buffer
+    (insert content)
+    (wit-ts-mode)
+    (goto-char (point-max))
+    (let* ((capf (wit-ts-mode-completion-at-point))
+           (prefix (buffer-substring-no-properties (nth 0 capf) (nth 1 capf))))
+      (mapcar #'substring-no-properties
+              (all-completions prefix (nth 2 capf))))))
+
+(ert-deftest wit-ts-mode-gate-completion-after-at ()
+  "After `@' the three feature gates are offered, tagged `gate'."
+  (skip-unless (treesit-ready-p 'wit t))
+  (let ((cands (wit-ts-mode-tests--capf-candidates "interface i {\n  @")))
+    (should (equal (sort (copy-sequence cands) #'string<)
+                   '("deprecated" "since" "unstable"))))
+  ;; A prefix narrows the set.
+  (should (equal (wit-ts-mode-tests--capf-candidates "interface i {\n  @un")
+                 '("unstable"))))
+
+(ert-deftest wit-ts-mode-gate-field-completion ()
+  "Inside a gate's parens the accepted field is offered."
+  (skip-unless (treesit-ready-p 'wit t))
+  (should (equal (wit-ts-mode-tests--capf-candidates "interface i {\n  @since(")
+                 '("version")))
+  (should (equal (wit-ts-mode-tests--capf-candidates
+                  "interface i {\n  @deprecated(")
+                 '("version")))
+  (should (equal (wit-ts-mode-tests--capf-candidates
+                  "interface i {\n  @unstable(")
+                 '("feature")))
+  ;; An unknown gate offers no field.
+  (should-not (wit-ts-mode-tests--capf-candidates "interface i {\n  @bogus(")))
+
+(ert-deftest wit-ts-mode-gate-context-does-not-leak-keywords ()
+  "Gate contexts offer only gates/fields, never the keyword list."
+  (skip-unless (treesit-ready-p 'wit t))
+  (should-not (member "interface"
+                      (wit-ts-mode-tests--capf-candidates "interface i {\n  @")))
+  (should-not (member "type"
+                      (wit-ts-mode-tests--capf-candidates
+                       "interface i {\n  @since("))))
+
 ;;; use names list (`use PATH.{ ... }')
 
 (ert-deftest wit-ts-mode-use-names-list-context-detection ()
@@ -627,6 +673,88 @@ advertises `identity' as its display sort so frontends preserve it."
     (insert "\ninterface i {\n  use nonesuch.{")
     (should (wit-ts-mode--in-use-names-list-p))
     (should-not (wit-ts-mode--member-candidates))))
+
+;;; Cross-reference (xref)
+
+(defun wit-ts-mode-tests--xref-summaries (identifier)
+  "Return the summary strings of xref items defining IDENTIFIER."
+  (mapcar #'xref-item-summary
+          (wit-ts-mode--xref-find-definitions identifier)))
+
+(ert-deftest wit-ts-mode-xref-backend-registered ()
+  "`wit-ts-mode' installs its xref backend."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (wit-ts-mode)
+    (should (eq (xref-find-backend) 'wit-ts-mode))))
+
+(ert-deftest wit-ts-mode-xref-identifier-at-point ()
+  "The identifier at point is a symbol, or a tagged use_path."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface i {\n  record widget { x: u32 }\n"
+            "  make: func() -> widget;\n}\n")
+    (wit-ts-mode)
+    (goto-char (point-min))
+    (search-forward "-> wid")
+    (let ((id (wit-ts-mode--identifier-at-point)))
+      (should (equal id "widget"))
+      (should-not (get-text-property 0 'wit-ts-mode--xref-path id))))
+  (with-temp-buffer
+    (insert "package a:b;\nworld w {\n  import wasi:http/handler@1.0.0;\n}\n")
+    (wit-ts-mode)
+    (goto-char (point-min))
+    (search-forward "wasi:ht")
+    (let ((id (wit-ts-mode--identifier-at-point)))
+      (should (equal id "wasi:http/handler@1.0.0"))
+      (should (get-text-property 0 'wit-ts-mode--xref-path id)))))
+
+(ert-deftest wit-ts-mode-xref-local-definition ()
+  "A bare name resolves to its definition in the current buffer."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface i {\n  record widget { x: u32 }\n"
+            "  make: func() -> widget;\n}\n")
+    (wit-ts-mode)
+    (should (equal (wit-ts-mode-tests--xref-summaries "widget")
+                   '("record widget")))))
+
+(ert-deftest wit-ts-mode-xref-use-path-to-foreign-interface ()
+  "A foreign use_path resolves to the interface in the dep file."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let* ((id (propertize "example:dep/dep-iface@0.1.0"
+                           'wit-ts-mode--xref-path t))
+           (defs (wit-ts-mode--xref-find-definitions id)))
+      (should (equal (mapcar #'xref-item-summary defs)
+                     '("interface dep-iface")))
+      ;; The location points into the dependency file.
+      (should (string-match-p
+               "dep\\.wit\\'"
+               (xref-location-group (xref-item-location (car defs))))))))
+
+(ert-deftest wit-ts-mode-xref-use-path-to-sibling-interface ()
+  "A bare use_path resolves to an interface in a sibling file."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((id (propertize "sibling-iface" 'wit-ts-mode--xref-path t)))
+      (should (equal (wit-ts-mode-tests--xref-summaries id)
+                     '("interface sibling-iface"))))))
+
+(ert-deftest wit-ts-mode-xref-member-in-names-list ()
+  "Inside a `use PATH.{ member }' list, point on a member jumps to it."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  use sibling-iface.{timestamp}\n}\n")
+    (goto-char (point-max))
+    (search-backward "timestamp")
+    (let ((id (wit-ts-mode--identifier-at-point)))
+      (should (equal id "timestamp"))
+      (should (equal (wit-ts-mode-tests--xref-summaries id)
+                     '("type timestamp"))))))
+
+(ert-deftest wit-ts-mode-xref-unknown-identifier ()
+  "An unknown identifier resolves to no definitions."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (should-not (wit-ts-mode--xref-find-definitions "no-such-name"))))
 
 ;;; Dependency synchronisation
 

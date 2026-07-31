@@ -37,11 +37,13 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'treesit)
 (require 'hideshow)
 (require 'flymake)
 (require 'outline)
 (require 'seq)
+(require 'xref)
 
 (declare-function treesit-parser-create "treesit.c")
 (declare-function treesit-node-type "treesit.c")
@@ -273,6 +275,20 @@ Most WIT declarations store their name in the `name' field; a
     "tuple" "list" "option" "result" "map" "borrow" "future" "stream")
   "WIT builtin and predefined type constructors offered for completion.")
 
+(defconst wit-ts-mode--gates
+  '("since" "unstable" "deprecated")
+  "WIT feature-gate attribute names offered after `@'.
+See the WIT spec's feature-gate grammar: `@since(version = ...)',
+`@unstable(feature = ...)', `@deprecated(version = ...)'.")
+
+(defconst wit-ts-mode--gate-fields
+  '(("since"      . "version")
+    ("deprecated" . "version")
+    ("unstable"   . "feature"))
+  "Alist mapping a WIT feature gate to the field name it takes.
+`@since'/`@deprecated' take `version = <semver>'; `@unstable'
+takes `feature = <id>' (per the WIT feature-gate grammar).")
+
 (defconst wit-ts-mode--kind-property 'wit-ts-mode--kind
   "Text property naming the WIT kind of a completion candidate.
 The value is a symbol such as `interface', `world', `record',
@@ -291,7 +307,9 @@ The value is a symbol such as `interface', `world', `record',
     (func      . " func")
     (package   . " package")
     (keyword   . " keyword")
-    (builtin   . " builtin type"))
+    (builtin   . " builtin type")
+    (gate      . " feature gate")
+    (field     . " gate field"))
   "Alist mapping a candidate's WIT kind to its completion annotation.
 The annotation is the text shown after a candidate in the
 completion UI (e.g. the `*Completions*' buffer).")
@@ -308,7 +326,9 @@ completion UI (e.g. the `*Completions*' buffer).")
     (func      . function)
     (package   . module)
     (keyword   . keyword)
-    (builtin   . type-parameter))
+    (builtin   . type-parameter)
+    (gate      . keyword)
+    (field     . property))
   "Alist mapping a candidate's WIT kind to a Company/Corfu `kind' symbol.
 These symbols select the icon shown by frontends that support the
 `company-kind' completion property (e.g. Corfu, Company).")
@@ -848,25 +868,70 @@ alias contributes the imported name x."
     (save-excursion (skip-chars-forward "[:alnum:]_-") (setq end (point)))
     (cons start end)))
 
+(defconst wit-ts-mode--gate-name-regexp
+  (rx "@" (group (* (any alnum ?_ ?-))) eos)
+  "Regexp matching a feature-gate attribute name typed after `@'.
+Group 1 is the (possibly empty) gate name up to point, e.g. the
+`sin' of `@sin'.")
+
+(defconst wit-ts-mode--gate-field-regexp
+  (rx "@" (group (+ (any alnum ?_ ?-)))       ; the gate name
+      "(" (* (not (any ?\) ?\n)))             ; inside the parens, up to point
+      eos)
+  "Regexp matching an in-progress feature-gate field, e.g. `@since(ver'.
+Group 1 is the gate name; a match means point is inside the gate's
+parentheses (before the closing `)').")
+
+(defun wit-ts-mode--gate-context ()
+  "Return the feature-gate completion context at point, or nil.
+The result is (KIND . GATE): KIND is `gate' when point is on the
+attribute name just after `@' (GATE is then nil), or `field' when
+point is inside a gate's parentheses (GATE is the gate name, e.g.
+\"since\").  Detected textually, since a partial gate parses as an
+ERROR node."
+  (let ((line-head (buffer-substring-no-properties
+                    (line-beginning-position) (point))))
+    (cond
+     ((string-match wit-ts-mode--gate-field-regexp line-head)
+      (cons 'field (match-string 1 line-head)))
+     ((string-match wit-ts-mode--gate-name-regexp line-head)
+      (cons 'gate nil)))))
+
+(defun wit-ts-mode--gate-candidates (context)
+  "Return feature-gate candidates for CONTEXT (from `wit-ts-mode--gate-context').
+For a `gate' context, the three gate names; for a `field' context,
+the field the named gate accepts (`version' or `feature'), or nil
+when the gate is unknown."
+  (pcase context
+    (`(gate . ,_)
+     (mapcar (lambda (g) (wit-ts-mode--kinded g 'gate)) wit-ts-mode--gates))
+    (`(field . ,gate)
+     (when-let* ((field (cdr (assoc gate wit-ts-mode--gate-fields))))
+       (list (wit-ts-mode--kinded field 'field))))))
+
 (defun wit-ts-mode-completion-at-point ()
   "Completion-at-point function for `wit-ts-mode'.
-Context-sensitive: in a `use PATH.{ ... }' names list, completes
-the target interface's type and resource members (see
-`wit-ts-mode--member-candidates').  In an `import'/`export'/`use'
-path, completes local interface names and foreign package paths
-\(see `wit-ts-mode--path-candidates').  Otherwise completes WIT
-keywords, builtin types, and identifiers defined in the current
-buffer.  Suitable for `completion-at-point-functions'."
+Context-sensitive: after `@' it completes feature-gate attributes
+\(`since'/`unstable'/`deprecated') and their fields.  In a
+`use PATH.{ ... }' names list, completes the target interface's
+type and resource members (see `wit-ts-mode--member-candidates').
+In an `import'/`export'/`use' path, completes local interface
+names and foreign package paths (see `wit-ts-mode--path-candidates').
+Otherwise completes WIT keywords, builtin types, and identifiers
+defined in the current buffer.  Suitable for
+`completion-at-point-functions'."
   (let ((node (treesit-node-at (point))))
     ;; Do not complete inside comments or string literals.
     (unless (wit-ts-mode--in-comment-or-string-p node)
-      (let* ((names-context (wit-ts-mode--in-use-names-list-p))
+      (let* ((gate-context (wit-ts-mode--gate-context))
+             (names-context (and (not gate-context)
+                                 (wit-ts-mode--in-use-names-list-p)))
              ;; A names list is inside `{ ... }', so the path regexp (which
              ;; stops at `{') never matches there; check it only otherwise.
-             (path-context (and (not names-context)
+             (path-context (and (not gate-context) (not names-context)
                                 (wit-ts-mode--in-use-path-p)))
              ;; `:'/`/' are part of a use_path, so widen past the default
-             ;; `symbol' bounds there; member names are ordinary ids.
+             ;; `symbol' bounds there; member and gate names are ordinary ids.
              (bounds (cond (path-context (wit-ts-mode--use-path-bounds))
                            (names-context (wit-ts-mode--use-name-bounds))
                            (t (bounds-of-thing-at-point 'symbol))))
@@ -875,7 +940,8 @@ buffer.  Suitable for `completion-at-point-functions'."
         (list start end
               (wit-ts-mode--completion-table
                (lambda ()
-                 (cond (names-context (wit-ts-mode--member-candidates))
+                 (cond (gate-context (wit-ts-mode--gate-candidates gate-context))
+                       (names-context (wit-ts-mode--member-candidates))
                        (path-context (wit-ts-mode--path-candidates))
                        (t (wit-ts-mode--completion-candidates)))))
               :exclusive 'no
@@ -928,6 +994,155 @@ characters of an ordinary symbol, so this widens past those."
       (goto-char end)
       (skip-chars-forward "[:alnum:]_%:/@.-")
       (cons start (max start (point))))))
+
+;;; Cross-reference (xref)
+
+;; Jump-to-definition reuses the completion resolver's model: a definition is
+;; found either in the current buffer or in another `.wit' file under the
+;; `wit-deps' root (siblings and resolved dependencies under DIR/deps/).  The
+;; completion index stores only names, so xref re-parses to recover positions.
+
+(defconst wit-ts-mode--xref-path-property 'wit-ts-mode--xref-path
+  "Text property flagging an xref identifier as a use_path.
+When set, `wit-ts-mode--xref-find-definitions' resolves the
+identifier as an `import'/`export'/`use' path (an interface)
+rather than a bare definition name.")
+
+(defun wit-ts-mode--identifier-at-point ()
+  "Return the WIT identifier around point, or nil.
+In an `import'/`export'/`use' path (or its names list) the whole
+path is returned, tagged with `wit-ts-mode--xref-path-property' so
+it is resolved as an interface reference.  Otherwise the symbol at
+point is returned."
+  (cond
+   ;; A `use PATH.{ ... }' names list: a member name under point jumps to
+   ;; that member (a bare type/resource name); otherwise the path names the
+   ;; interface to jump to.
+   ((wit-ts-mode--in-use-names-list-p)
+    (or (thing-at-point 'symbol t)
+        (when-let* ((path (wit-ts-mode--current-use-path)))
+          (propertize path wit-ts-mode--xref-path-property t))))
+   ;; An import/export/use path position.
+   ((wit-ts-mode--in-use-path-p)
+    (let ((bounds (wit-ts-mode--use-path-bounds)))
+      (when (< (car bounds) (cdr bounds))
+        (propertize (buffer-substring-no-properties (car bounds) (cdr bounds))
+                    wit-ts-mode--xref-path-property t))))
+   (t
+    (thing-at-point 'symbol t))))
+
+(defun wit-ts-mode--definitions-in-node (root query)
+  "Return definitions captured by QUERY under ROOT as position records.
+Each record is a plist (:name NAME :kind KIND :node NODE); NODE is
+the captured name node, from which callers derive a location."
+  (mapcar (lambda (cap)
+            (list :name (treesit-node-text (cdr cap) t)
+                  :kind (car cap)
+                  :node (cdr cap)))
+          (treesit-query-capture root query nil nil nil)))
+
+(defun wit-ts-mode--xref-make-item (name kind file node)
+  "Build an `xref-item' for NAME of KIND at NODE's position in FILE.
+FILE nil means the current buffer.  A summary line prefixes the
+kind so the *xref* buffer reads, e.g., \"interface handler\"."
+  (let* ((start (treesit-node-start node))
+         (line (line-number-at-pos start))
+         (column (save-excursion (goto-char start) (current-column)))
+         (summary (format "%s %s" (or kind "def") name))
+         (location (if file
+                       (xref-make-file-location file line column)
+                     (xref-make-buffer-location (current-buffer) start))))
+    (xref-make summary location)))
+
+(defun wit-ts-mode--xref-defs-in-file (file names)
+  "Return xref items for definitions named in NAMES found in FILE.
+FILE is parsed in a temporary buffer; NAMES is a list of strings.
+Positions are resolved against a widened view of that buffer so
+`line-number-at-pos' and `current-column' are accurate."
+  (when (treesit-ready-p 'wit t)
+    (ignore-errors
+      (with-temp-buffer
+        (insert-file-contents file)
+        (let* ((parser (treesit-parser-create 'wit))
+               (root (treesit-parser-root-node parser))
+               items)
+          (dolist (def (wit-ts-mode--definitions-in-node
+                        root wit-ts-mode--completion-defs-query))
+            (when (member (plist-get def :name) names)
+              (push (wit-ts-mode--xref-make-item
+                     (plist-get def :name) (plist-get def :kind)
+                     file (plist-get def :node))
+                    items)))
+          (nreverse items))))))
+
+(defun wit-ts-mode--xref-buffer-defs (names)
+  "Return xref items for definitions named in NAMES in the current buffer."
+  (when-let* ((parser (wit-ts-mode--parser)))
+    (let (items)
+      (dolist (def (wit-ts-mode--definitions-in-node
+                    (treesit-parser-root-node parser)
+                    wit-ts-mode--completion-defs-query))
+        (when (member (plist-get def :name) names)
+          (push (wit-ts-mode--xref-make-item
+                 (plist-get def :name) (plist-get def :kind)
+                 nil (plist-get def :node))
+                items)))
+      (nreverse items))))
+
+(defun wit-ts-mode--xref-path-target (path)
+  "Return the interface NAME a use_path PATH refers to, ignoring package.
+The definition of `wasi:clocks/wall-clock@0.2.10' is the interface
+`wall-clock'; a bare `types' resolves to the interface `types'.
+A trailing `.' (the separator before a `.{ ... }' names body) is
+stripped first, so `types.' resolves to `types' too."
+  (cdr (wit-ts-mode--split-use-path
+        (string-remove-suffix "." path))))
+
+(defun wit-ts-mode--xref-find-definitions (identifier)
+  "Return a list of xref items defining IDENTIFIER.
+IDENTIFIER is what `wit-ts-mode--identifier-at-point' returned: a
+use_path (tagged with `wit-ts-mode--xref-path-property', resolved
+to its interface name) or a bare definition name.  Searches the
+current buffer first, then the other `.wit' files under the
+`wit-deps' root."
+  (when (and identifier (> (length identifier) 0))
+    (let* ((path-p (get-text-property 0 wit-ts-mode--xref-path-property
+                                      identifier))
+           (name (if path-p
+                     (wit-ts-mode--xref-path-target identifier)
+                   (substring-no-properties identifier)))
+           (names (list name))
+           (self (and buffer-file-name (expand-file-name buffer-file-name)))
+           (items (wit-ts-mode--xref-buffer-defs names)))
+      (when-let* ((roots (wit-ts-mode--wit-root))
+                  (wit-root (car roots)))
+        (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
+          (unless (equal (expand-file-name file) self)
+            (setq items
+                  (nconc items (wit-ts-mode--xref-defs-in-file file names))))))
+      items)))
+
+;; The backend is a function returning a symbol; its methods dispatch on it.
+(defun wit-ts-mode--xref-backend ()
+  "Return the xref backend symbol for `wit-ts-mode'."
+  'wit-ts-mode)
+
+(cl-defmethod xref-backend-identifier-at-point ((_backend (eql wit-ts-mode)))
+  "Return the WIT identifier at point for the `wit-ts-mode' xref backend."
+  (wit-ts-mode--identifier-at-point))
+
+(cl-defmethod xref-backend-definitions ((_backend (eql wit-ts-mode)) identifier)
+  "Return xref items defining IDENTIFIER for the `wit-ts-mode' backend."
+  (wit-ts-mode--xref-find-definitions identifier))
+
+(cl-defmethod xref-backend-identifier-completion-table
+  ((_backend (eql wit-ts-mode)))
+  "Return the buffer's definition names for `wit-ts-mode' xref completion."
+  (mapcar (lambda (def) (plist-get def :name))
+          (when-let* ((parser (wit-ts-mode--parser)))
+            (wit-ts-mode--definitions-in-node
+             (treesit-parser-root-node parser)
+             wit-ts-mode--completion-defs-query))))
 
 ;;; Folding
 
@@ -1324,6 +1539,10 @@ Both run the `wit-ts-deps-executable' program asynchronously.
   ;; Completion: keywords, builtin types, and buffer-local definitions.
   (add-hook 'completion-at-point-functions
             #'wit-ts-mode-completion-at-point nil t)
+
+  ;; Cross-reference: jump to definitions with `xref-find-definitions'
+  ;; (\\[xref-find-definitions]), across the buffer and project files.
+  (add-hook 'xref-backend-functions #'wit-ts-mode--xref-backend nil t)
 
   (treesit-major-mode-setup))
 
