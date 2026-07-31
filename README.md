@@ -34,7 +34,9 @@ translation of that project's `queries/highlights.scm`; folding mirrors
 - **Syntax checking** — a Flymake backend that surfaces tree-sitter parse
   errors (unexpected input and missing tokens such as an unclosed brace).
 - **Completion** — a `completion-at-point` function offering WIT keywords,
-  builtin types, and identifiers defined in the current buffer.
+  builtin types, and identifiers defined in the current buffer, plus — for
+  `wit-deps`-managed projects — identifiers from sibling files and resolved
+  dependencies (`M-x wit-ts-deps-sync` refreshes them).
 
 ## Requirements
 
@@ -195,7 +197,11 @@ The mode adds a `completion-at-point` function, so `M-x completion-at-point`
 - **builtin types** — `u8`…`u64`, `string`, `list`, `option`, `result`, …;
 - **buffer definitions** — the names of interfaces, worlds, records,
   variants, enums, flags, resources, type aliases, and functions defined in
-  the current file.
+  the current file;
+- **cross-file definitions** — when the file belongs to a
+  [`wit-deps`][wit-deps]-managed project, the same kinds of definitions from
+  every other `.wit` file in that tree: sibling package files and resolved
+  dependencies under `wit/deps/` (see below).
 
 Completion is suppressed inside comments and string literals. Candidates are
 gathered from the parse tree, so newly typed definitions become available as
@@ -204,8 +210,40 @@ soon as they parse. Any completion UI that reads
 `completion-at-point` — picks these up automatically; in Doom the configured
 front-end (Corfu or Company) just works.
 
-Completion is buffer-local: it does not resolve `use`d packages or offer
-type-aware filtering.
+### Cross-file symbols and dependencies
+
+There is no WIT language server, so `wit-ts-mode` resolves cross-file symbols
+itself. A project laid out for the [`wit-deps`][wit-deps] CLI has a manifest at
+`wit/deps.toml` and resolved dependency sources under `wit/deps/`. When the
+current file lives in such a tree, completion parses the other `.wit` files
+there (with the same tree-sitter grammar) and offers their definitions too.
+
+To fetch or refresh the dependencies, run one of:
+
+```
+M-x wit-ts-deps-sync     ; wit-deps        — populate deps/ from the lock file
+M-x wit-ts-deps-update   ; wit-deps update — pull latest, rewrite the lock file
+```
+
+`wit-ts-deps-sync` runs bare `wit-deps` (equivalent to `wit-deps lock`): it
+populates `wit/deps/` from the manifest while honouring the existing
+`deps.lock`, so pinned versions do not change. `wit-ts-deps-update` runs
+`wit-deps update`, pulling the latest sources for dynamic references (such as a
+tracked branch) and rewriting `deps.lock`.
+
+Both invoke `wit-ts-deps-executable` (default `wit-deps`) in the project root,
+streaming output to the `*wit-deps*` buffer; on success the resolved sources
+become available to completion. The mode never runs the CLI implicitly — no
+network access happens unless you ask for it — and it does not author
+`deps.toml` for you; supply your own manifest. The managed directory name
+defaults to `wit` but is configurable via `wit-ts-deps-directory`, matching the
+corresponding `wit-deps` option.
+
+Off-buffer files are parsed on demand and cached by modification time, so
+completion stays cheap even with a large `wit/deps/` tree; both commands clear
+that cache on success.
+
+[wit-deps]: https://github.com/bytecodealliance/wit-deps
 
 ## Highlighting notes
 

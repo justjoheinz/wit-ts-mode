@@ -1,0 +1,9 @@
+package example:dep@0.1.0;
+
+interface dep-iface {
+    record widget {
+        id: u32,
+    }
+
+    gadget: func() -> widget;
+}

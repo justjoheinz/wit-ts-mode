@@ -111,6 +111,22 @@ run `M-x treesit-install-language-grammar RET wit RET'")))
   :safe #'natnump
   :group 'wit-ts)
 
+(defcustom wit-ts-deps-executable "wit-deps"
+  "Program used to resolve WIT dependencies.
+Invoked by `wit-ts-deps-sync' to populate the dependency directory.
+Resolved on `exec-path' via `executable-find', so a bare program
+name or an absolute path both work."
+  :type 'string
+  :group 'wit-ts)
+
+(defcustom wit-ts-deps-directory "wit"
+  "Name of the directory `wit-deps' manages, relative to the project.
+Its manifest lives at DIR/deps.toml and resolved dependencies at
+DIR/deps/.  `wit' is the `wit-deps' default but is configurable,
+so `wit-ts-mode' does not hardcode it."
+  :type 'string
+  :group 'wit-ts)
+
 ;;; Indentation
 
 (defvar wit-ts-mode--indent-rules
@@ -281,10 +297,181 @@ the various type and function definitions)."
               wit-ts-mode--completion-defs-query nil nil t)))))
 
 (defun wit-ts-mode--completion-candidates ()
-  "Return all completion candidates: keywords, builtins, definitions."
+  "Return all completion candidates: keywords, builtins, definitions.
+Definitions come from the current buffer and, when the buffer
+belongs to a `wit-deps'-managed project, from the other `.wit'
+files in that tree (sibling package files and resolved
+dependencies under DIR/deps/)."
   (append wit-ts-mode--keywords
           wit-ts-mode--builtin-types
-          (wit-ts-mode--buffer-definitions)))
+          (wit-ts-mode--buffer-definitions)
+          (wit-ts-mode--external-definitions)))
+
+;;; Cross-file symbols
+
+;; Real WIT projects span several files: sibling files within one package and
+;; foreign packages pulled in via `use'/`import'.  There is no WIT language
+;; server, so symbols outside the current buffer are otherwise invisible.  The
+;; `wit-deps' CLI resolves declared dependencies into DIR/deps/ on disk; once
+;; the sources are there we parse them with the same tree-sitter grammar the
+;; mode already loads and fold their definitions into completion.
+
+(defun wit-ts-mode--wit-root ()
+  "Locate the `wit-deps'-managed directory for the current buffer.
+Return a cons (WIT-ROOT . PROJECT-ROOT), where WIT-ROOT is the
+directory holding deps.toml and PROJECT-ROOT is the directory in
+which `wit-deps' should run (WIT-ROOT's parent).  Return nil when
+the buffer is not visiting a file or no manifest is found.
+
+Two layouts are recognised, walking up from the buffer's file:
+an ancestor DIR containing `wit-ts-deps-directory'/deps.toml (root
+is that subdirectory), or an ancestor that is itself the managed
+directory and contains deps.toml directly."
+  (when-let* ((file buffer-file-name)
+              (start (file-name-directory file)))
+    (let (result)
+      (locate-dominating-file
+       start
+       (lambda (dir)
+         (let ((nested (expand-file-name
+                        (concat (file-name-as-directory wit-ts-deps-directory)
+                                "deps.toml")
+                        dir)))
+           (cond
+            ((file-exists-p nested)
+             (setq result
+                   (cons (file-name-directory nested)
+                         (file-name-as-directory (expand-file-name dir))))
+             t)
+            ((and (file-exists-p (expand-file-name "deps.toml" dir))
+                  (equal (file-name-nondirectory
+                          (directory-file-name dir))
+                         wit-ts-deps-directory))
+             (setq result
+                   (cons (file-name-as-directory (expand-file-name dir))
+                         (file-name-directory
+                          (directory-file-name dir))))
+             t)
+            (t nil)))))
+      result)))
+
+(defvar wit-ts-mode--definitions-cache (make-hash-table :test 'equal)
+  "Cache of parsed off-buffer definitions, keyed by absolute file name.
+Each value is a cons (MTIME . NAMES); a file is re-parsed only when
+its modification time changes.  Cleared by `wit-ts-deps-sync' so
+freshly fetched dependencies are picked up.")
+
+(defun wit-ts-mode--file-definitions (file)
+  "Return the WIT definition names declared in FILE.
+FILE is parsed in a temporary buffer with the `wit' grammar, using
+the same query as buffer-local completion.  Results are memoised in
+`wit-ts-mode--definitions-cache' keyed by FILE and its mtime.
+Return nil if the grammar is unavailable or FILE cannot be read."
+  (when (treesit-ready-p 'wit t)
+    (let* ((attrs (file-attributes file))
+           (mtime (and attrs (file-attribute-modification-time attrs)))
+           (cached (gethash file wit-ts-mode--definitions-cache)))
+      (if (and cached mtime (equal (car cached) mtime))
+          (cdr cached)
+        (let ((names
+               (ignore-errors
+                 (with-temp-buffer
+                   (insert-file-contents file)
+                   (let ((parser (treesit-parser-create 'wit)))
+                     (delete-dups
+                      (mapcar (lambda (node) (treesit-node-text node t))
+                              (treesit-query-capture
+                               (treesit-parser-root-node parser)
+                               wit-ts-mode--completion-defs-query
+                               nil nil t))))))))
+          (when mtime
+            (puthash file (cons mtime names) wit-ts-mode--definitions-cache))
+          names)))))
+
+(defun wit-ts-mode--external-definitions ()
+  "Return definition names from other `.wit' files in the project tree.
+Scans `.wit' files recursively under the `wit-deps'-managed root
+\(see `wit-ts-mode--wit-root'), excluding the current buffer's own
+file.  Return nil when the buffer is not part of such a project."
+  (when-let* ((roots (wit-ts-mode--wit-root))
+              (wit-root (car roots)))
+    (let ((self (and buffer-file-name (expand-file-name buffer-file-name)))
+          names)
+      (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
+        (unless (equal (expand-file-name file) self)
+          (setq names (nconc names (wit-ts-mode--file-definitions file)))))
+      (delete-dups names))))
+
+;;; Dependency synchronisation
+
+(defun wit-ts-mode--deps-run (args label)
+  "Run `wit-ts-deps-executable' with ARGS asynchronously for this project.
+ARGS is a list of extra command-line arguments (nil for the bare
+`lock' behaviour).  LABEL names the operation in progress messages.
+The process runs in the project root (the parent of the
+`wit-deps'-managed directory), streaming output to the `*wit-deps*'
+buffer.  On success the off-buffer definitions cache is cleared so
+the next completion re-scans the resolved sources.
+
+Signals a `user-error' if the executable is not found or the
+current buffer is not part of a `wit-deps' project (no
+DIR/deps.toml)."
+  (unless (executable-find wit-ts-deps-executable)
+    (user-error "Cannot find `%s' on `exec-path'; set `wit-ts-deps-executable'"
+                wit-ts-deps-executable))
+  (let ((roots (wit-ts-mode--wit-root)))
+    (unless roots
+      (user-error "No `%s/deps.toml' found for this buffer"
+                  wit-ts-deps-directory))
+    (let* ((default-directory (cdr roots))
+           (command (cons wit-ts-deps-executable args))
+           (buffer (get-buffer-create "*wit-deps*")))
+      (with-current-buffer buffer
+        (setq buffer-read-only nil)
+        (erase-buffer)
+        (insert (format "Running %s in %s\n\n"
+                        (mapconcat #'identity command " ")
+                        default-directory)))
+      (make-process
+       :name "wit-deps"
+       :buffer buffer
+       :command command
+       :noquery t
+       :sentinel
+       (lambda (proc _event)
+         (when (memq (process-status proc) '(exit signal))
+           (if (and (eq (process-status proc) 'exit)
+                    (zerop (process-exit-status proc)))
+               (progn
+                 (clrhash wit-ts-mode--definitions-cache)
+                 (message "wit-deps: %s complete" label))
+             (message "wit-deps %s failed (exit %s); see *wit-deps*"
+                      label (process-exit-status proc)))))))))
+
+;;;###autoload
+(defun wit-ts-deps-sync ()
+  "Resolve WIT dependencies for the current project with `wit-deps'.
+Runs `wit-deps' (equivalent to `wit-deps lock'): it populates the
+dependency directory from the manifest, honouring the existing
+lock file without changing pinned versions.  To pull newer sources
+for dynamic references, use `wit-ts-deps-update' instead.
+
+See `wit-ts-mode--deps-run' for the execution model and the errors
+this may signal."
+  (interactive)
+  (wit-ts-mode--deps-run nil "sync"))
+
+;;;###autoload
+(defun wit-ts-deps-update ()
+  "Update WIT dependencies for the current project with `wit-deps update'.
+Unlike `wit-ts-deps-sync', this pulls the latest sources for
+dynamic references (such as a tracked branch) and rewrites the
+lock file.
+
+See `wit-ts-mode--deps-run' for the execution model and the errors
+this may signal."
+  (interactive)
+  (wit-ts-mode--deps-run '("update") "update"))
 
 (defun wit-ts-mode--in-comment-or-string-p (node)
   "Return non-nil if NODE is, or is inside, a comment or string."

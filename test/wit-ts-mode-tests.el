@@ -19,6 +19,7 @@
 
 (require 'ert)
 (require 'ert-x)
+(require 'cl-lib)
 (require 'wit-ts-mode)
 (require 'flymake)
 (require 'which-func)
@@ -278,6 +279,111 @@ above it."
            (matches (all-completions prefix (nth 2 capf))))
       (should (equal prefix "poi"))
       (should (member "point" matches)))))
+
+;;; Cross-file symbols
+
+(defmacro wit-ts-mode-tests--with-project-file (relpath &rest body)
+  "Visit RELPATH (under test/resources/) in `wit-ts-mode' with a file name.
+Unlike `wit-ts-mode-tests--with-file', this sets `buffer-file-name'
+so the `wit-deps' project-root detection can walk the directory
+tree.  Skips the test if the WIT grammar is not ready."
+  (declare (indent 1) (debug (form body)))
+  `(progn
+     (skip-unless (treesit-ready-p 'wit t))
+     (let ((file (ert-resource-file ,relpath)))
+       (with-temp-buffer
+         (insert-file-contents file)
+         (setq buffer-file-name file)
+         (unwind-protect
+             (progn (wit-ts-mode) ,@body)
+           ;; Avoid `kill-buffer' prompting about the phantom file.
+           (set-buffer-modified-p nil)
+           (setq buffer-file-name nil))))))
+
+(ert-deftest wit-ts-mode-wit-root-locates-managed-dir ()
+  "`wit-ts-mode--wit-root' finds the deps.toml root and project root."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let* ((roots (wit-ts-mode--wit-root))
+           (wit-root (car roots))
+           (project-root (cdr roots)))
+      (should roots)
+      (should (file-exists-p (expand-file-name "deps.toml" wit-root)))
+      (should (equal (file-name-nondirectory (directory-file-name wit-root))
+                     "wit"))
+      ;; Project root is the parent, where `wit-deps' would run.
+      (should (equal (expand-file-name wit-root)
+                     (expand-file-name "wit/" project-root))))))
+
+(ert-deftest wit-ts-mode-file-definitions-parses-dep ()
+  "`wit-ts-mode--file-definitions' returns names from an off-buffer file."
+  (skip-unless (treesit-ready-p 'wit t))
+  (let* ((dep (ert-resource-file "proj/wit/deps/dep/dep.wit"))
+         (names (wit-ts-mode--file-definitions dep)))
+    (should (member "dep-iface" names))
+    (should (member "widget" names))
+    (should (member "gadget" names))))
+
+(ert-deftest wit-ts-mode-external-definitions-included-in-completion ()
+  "Completion candidates include symbols defined only in a dep file."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((cands (wit-ts-mode--completion-candidates)))
+      ;; Defined in the current buffer.
+      (should (member "app" cands))
+      ;; Defined only under wit/deps/.
+      (should (member "widget" cands))
+      (should (member "gadget" cands)))))
+
+(ert-deftest wit-ts-mode-external-definitions-excludes-self ()
+  "The current buffer's own file is not re-scanned as an external file."
+  (skip-unless (treesit-ready-p 'wit t))
+  ;; A file not inside any wit-deps project yields no external defs.
+  (with-temp-buffer
+    (insert "package a:b;\ninterface solo { type t = u32; }\n")
+    (setq buffer-file-name (make-temp-file "wit-solo" nil ".wit"))
+    (unwind-protect
+        (progn
+          (wit-ts-mode)
+          (should-not (wit-ts-mode--external-definitions)))
+      (ignore-errors (delete-file buffer-file-name))
+      (set-buffer-modified-p nil)
+      (setq buffer-file-name nil))))
+
+;;; Dependency synchronisation
+
+(ert-deftest wit-ts-mode-deps-sync-errors-without-executable ()
+  "`wit-ts-deps-sync' signals a clear error when the CLI is absent."
+  (skip-unless (treesit-ready-p 'wit t))
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
+      (should-error (wit-ts-deps-sync) :type 'user-error))))
+
+(ert-deftest wit-ts-mode-deps-update-errors-without-executable ()
+  "`wit-ts-deps-update' signals a clear error when the CLI is absent."
+  (skip-unless (treesit-ready-p 'wit t))
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) nil)))
+      (should-error (wit-ts-deps-update) :type 'user-error))))
+
+(ert-deftest wit-ts-mode-deps-run-passes-args-and-dir ()
+  "`wit-ts-mode--deps-run' runs the CLI with the right args in the root."
+  (skip-unless (treesit-ready-p 'wit t))
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let (captured-command captured-dir)
+      (cl-letf (((symbol-function 'executable-find) (lambda (&rest _) "wit-deps"))
+                ((symbol-function 'make-process)
+                 (lambda (&rest args)
+                   (setq captured-command (plist-get args :command)
+                         captured-dir default-directory)
+                   ;; Return a dummy so the caller does not choke.
+                   nil)))
+        (wit-ts-deps-update)
+        (should (equal captured-command '("wit-deps" "update")))
+        ;; Runs in the project root (parent of the managed `wit' dir).
+        (should (equal (file-name-nondirectory
+                        (directory-file-name captured-dir))
+                       "proj"))
+        (wit-ts-deps-sync)
+        (should (equal captured-command '("wit-deps")))))))
 
 (provide 'wit-ts-mode-tests)
 
