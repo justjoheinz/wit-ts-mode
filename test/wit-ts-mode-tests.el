@@ -756,6 +756,27 @@ advertises `identity' as its display sort so frontends preserve it."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
     (should-not (wit-ts-mode--xref-find-definitions "no-such-name"))))
 
+;;; Read-only dependency files
+
+(ert-deftest wit-ts-mode-deps-file-is-read-only ()
+  "A file under DIR/deps/ is detected as a dependency and visited read-only."
+  (wit-ts-mode-tests--with-project-file "proj/wit/deps/dep/dep.wit"
+    (should (wit-ts-mode--in-deps-directory-p))
+    (should buffer-read-only)))
+
+(ert-deftest wit-ts-mode-root-file-is-writable ()
+  "A file outside DIR/deps/ is not a dependency and stays writable."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (should-not (wit-ts-mode--in-deps-directory-p))
+    (should-not buffer-read-only)))
+
+(ert-deftest wit-ts-mode-deps-read-only-can-be-disabled ()
+  "With `wit-ts-mode-deps-read-only' nil, dependency files stay writable."
+  (let ((wit-ts-mode-deps-read-only nil))
+    (wit-ts-mode-tests--with-project-file "proj/wit/deps/dep/dep.wit"
+      (should (wit-ts-mode--in-deps-directory-p))
+      (should-not buffer-read-only))))
+
 ;;; Dependency synchronisation
 
 (ert-deftest wit-ts-mode-deps-sync-errors-without-executable ()

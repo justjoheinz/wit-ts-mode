@@ -129,6 +129,14 @@ so `wit-ts-mode' does not hardcode it."
   :type 'string
   :group 'wit-ts)
 
+(defcustom wit-ts-mode-deps-read-only t
+  "When non-nil, visit dependency `.wit' files read-only.
+Files under the `wit-deps'-managed DIR/deps/ directory are fetched
+artifacts, not sources to edit (e.g. those reached by jumping to a
+definition).  Set to nil to allow editing them."
+  :type 'boolean
+  :group 'wit-ts)
+
 ;;; Indentation
 
 (defvar wit-ts-mode--indent-rules
@@ -519,6 +527,15 @@ directory and contains deps.toml directly."
              t)
             (t nil)))))
       result)))
+
+(defun wit-ts-mode--in-deps-directory-p ()
+  "Return non-nil if the current buffer's file is under DIR/deps/.
+That is the `wit-deps'-managed dependency directory (see
+`wit-ts-mode--wit-root'), whose files are fetched artifacts."
+  (when-let* ((file buffer-file-name)
+              (roots (wit-ts-mode--wit-root))
+              (deps (expand-file-name "deps/" (car roots))))
+    (file-in-directory-p (expand-file-name file) deps)))
 
 (defvar wit-ts-mode--definitions-cache (make-hash-table :test 'equal)
   "Cache of symbols parsed from off-buffer `.wit' files.
@@ -1485,6 +1502,9 @@ directory (see `wit-ts-deps-directory').  Manage them with:
 
 Both run the `wit-ts-deps-executable' program asynchronously.
 
+Files under that dependency directory are fetched artifacts, so
+they are visited read-only (see `wit-ts-mode-deps-read-only').
+
 \\{wit-ts-mode-map}"
   :group 'wit-ts
   (wit-ts-mode--ensure-grammar)
@@ -1543,6 +1563,12 @@ Both run the `wit-ts-deps-executable' program asynchronously.
   ;; Cross-reference: jump to definitions with `xref-find-definitions'
   ;; (\\[xref-find-definitions]), across the buffer and project files.
   (add-hook 'xref-backend-functions #'wit-ts-mode--xref-backend nil t)
+
+  ;; Dependency files (under DIR/deps/) are fetched artifacts, so visit
+  ;; them read-only -- e.g. when jumping to a definition there.
+  (when (and wit-ts-mode-deps-read-only
+             (wit-ts-mode--in-deps-directory-p))
+    (setq buffer-read-only t))
 
   (treesit-major-mode-setup))
 
