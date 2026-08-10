@@ -671,6 +671,54 @@ advertises `identity' as its display sort so frontends preserve it."
                       (wit-ts-mode-tests--capf-candidates
                        "interface i {\n  @since("))))
 
+(ert-deftest wit-ts-mode-gate-on-nested-items-parses-clean ()
+  "Feature gates on nested items parse without ERROR/MISSING nodes.
+Since tree-sitter-wit commit cdf0726 a gate may precede a record
+field, variant case, enum case, flags field, or resource method
+\(and constructor).  Each such form must parse cleanly."
+  (skip-unless (treesit-ready-p 'wit t))
+  (dolist (body '("record r {\n    @since(version = 0.2.0)\n    id: u64,\n\
+    @deprecated(version = 0.3.0)\n    name: string,\n  }"
+                  "variant v {\n    @since(version = 0.2.0)\n    none,\n\
+    @unstable(feature = x)\n    some(u32),\n  }"
+                  "enum e {\n    @since(version = 0.2.0)\n    hot,\n    cold,\n  }"
+                  "flags f {\n    @since(version = 0.2.0)\n    get,\n    post,\n  }"
+                  "resource b {\n    @since(version = 0.2.0)\n    constructor(x: u32);\n\
+    @since(version = 0.3.0)\n    merge: func();\n  }"))
+    (with-temp-buffer
+      (insert "package a:b;\ninterface i {\n  " body "\n}\n")
+      (wit-ts-mode)
+      (let ((root (treesit-buffer-root-node)))
+        (should-not (treesit-query-capture root '((ERROR) @e) nil nil t))
+        (should-not (treesit-search-subtree
+                     root (lambda (n) (treesit-node-check n 'missing)) nil t))))))
+
+(ert-deftest wit-ts-mode-gate-on-nested-items-diagnostics-clean ()
+  "A valid file with gates on nested items yields no diagnostics."
+  (skip-unless (treesit-ready-p 'wit t))
+  (should-not
+   (wit-ts-mode-tests--diagnostic-texts
+    (concat "package a:b;\ninterface i {\n"
+            "  record r {\n"
+            "    @since(version = 0.2.0)\n    id: u64,\n"
+            "    @deprecated(version = 0.3.0)\n    name: string,\n"
+            "  }\n}\n"))))
+
+(ert-deftest wit-ts-mode-gate-on-nested-item-fontifies ()
+  "A gate before a nested item is fontified: keyword and `feature' id."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface i {\n  record r {\n"
+            "    @unstable(feature = experimental)\n    id: u64,\n  }\n}\n")
+    (wit-ts-mode)
+    (font-lock-ensure)
+    ;; The gate keyword after `@'.
+    (should (eq (wit-ts-mode-tests--face-at "unstable")
+                'font-lock-builtin-face))
+    ;; The `@unstable(feature = ...)' feature id.
+    (should (eq (wit-ts-mode-tests--face-at "experimental")
+                'font-lock-string-face))))
+
 ;;; use names list (`use PATH.{ ... }')
 
 (ert-deftest wit-ts-mode-use-names-list-context-detection ()
