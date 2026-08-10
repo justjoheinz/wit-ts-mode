@@ -1426,18 +1426,22 @@ current buffer first, then the other `.wit' files under the
 
 ;; Translation of queries/folds.scm.  The grammar folds on `(body)' nodes
 ;; (the braced blocks of worlds, interfaces, records, resources, variants,
-;; ...) and on block comments.  hideshow drives this from its per-mode
-;; entry in `hs-special-modes-alist'.  That variable is obsolete as of
-;; Emacs 31.1 but still honoured (and is the only cross-version way to
-;; configure block *and* comment folding, since `hs-minor-mode' otherwise
-;; overwrites the buffer-local parameters), so the warning is suppressed.
-(defvar wit-ts-mode--hideshow-spec
-  '(wit-ts-mode "{" "}" "/[*/]" nil nil)
-  "Entry describing WIT block folds for hideshow.")
-
-(with-suppressed-warnings ((obsolete hs-special-modes-alist))
-  (unless (assq 'wit-ts-mode hs-special-modes-alist)
-    (add-to-list 'hs-special-modes-alist wit-ts-mode--hideshow-spec)))
+;; ...) and on block comments.  hideshow reads its block and comment
+;; regexps from buffer-local variables; historically these were seeded
+;; per-mode from `hs-special-modes-alist', but that variable is obsolete
+;; as of Emacs 31.1 in favour of setting the locals directly.  We set them
+;; from `hs-minor-mode-hook' (see `wit-ts-mode--setup-hideshow'), which
+;; runs after `hs-grok-mode-type' has otherwise initialised them.
+(defun wit-ts-mode--setup-hideshow ()
+  "Configure hideshow's block/comment regexps for WIT, buffer-locally.
+Sets `hs-block-start-regexp', `hs-block-end-regexp' and
+`hs-c-start-regexp' so `hs-minor-mode' folds WIT brace blocks and
+block comments.  Installed on `hs-minor-mode-hook', which runs
+after `hs-grok-mode-type', so these values are not overwritten.
+Replaces the obsolete (Emacs 31.1) `hs-special-modes-alist' entry."
+  (setq-local hs-block-start-regexp "{"
+              hs-block-end-regexp   "}"
+              hs-c-start-regexp     "/[*/]"))
 
 ;;; Outline
 
@@ -2069,9 +2073,11 @@ Generation:
                  nil nil)
                 ("Function" "\\`func_item\\'" nil nil)))
 
-  ;; Folding: hideshow reads the `hs-special-modes-alist' entry above; a
-  ;; tree-sitter-driven outline covers the declaration hierarchy, via a
-  ;; custom search function (see `wit-ts-mode--outline-search').
+  ;; Folding: `hs-minor-mode' folds brace blocks, configured buffer-locally
+  ;; via `wit-ts-mode--setup-hideshow' (see above); a tree-sitter-driven
+  ;; outline covers the declaration hierarchy, via a custom search function
+  ;; (see `wit-ts-mode--outline-search').
+  (add-hook 'hs-minor-mode-hook #'wit-ts-mode--setup-hideshow nil t)
   (setq-local outline-search-function #'wit-ts-mode--outline-search)
   (setq-local outline-level #'wit-ts-mode--outline-level)
 
