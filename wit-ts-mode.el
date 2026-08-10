@@ -512,6 +512,26 @@ kinded candidates -- the identifiers valid in a
               alist)))
     alist))
 
+(defconst wit-ts-mode--world-name-query
+  '((world_item name: (id) @world))
+  "Tree-sitter query capturing the names of world definitions.
+These are the definitions an `include' path may refer to (by bare
+name within a package, or as ns:pkg/NAME across packages); a
+plain `use'/`import'/`export' path refers to an interface.")
+
+(defun wit-ts-mode--world-names (root)
+  "Return the plain names of worlds defined under ROOT, deduplicated.
+Unlike interfaces, worlds have no `use'-able members, so only
+their names are collected (the identifiers valid after
+`include')."
+  (let (seen)
+    (dolist (cap (treesit-query-capture root wit-ts-mode--world-name-query
+                                        nil nil nil))
+      (let ((name (treesit-node-text (cdr cap) t)))
+        (unless (member name seen)
+          (push name seen))))
+    (nreverse seen)))
+
 (defun wit-ts-mode--buffer-definitions ()
   "Return the definitions of the current buffer as kinded candidates.
 Collected from the tree-sitter parse tree (interfaces, worlds, and
@@ -595,8 +615,10 @@ freshly fetched dependencies are picked up.")
   "Parse FILE with the `wit' grammar and return a plist of its symbols.
 The plist has keys `:package' (the declared package id, or nil),
 `:version' (the package @version, or nil), `:interfaces' (a list
-of interface and world names) and `:members' (an alist mapping
-each interface name to its `use'-able type/resource members).
+of interface and world names), `:worlds' (the list of world
+names, for resolving `include' paths) and `:members' (an alist
+mapping each interface name to its `use'-able type/resource
+members).
 Result is memoised in `wit-ts-mode--definitions-cache' keyed by
 FILE and its mtime.  Return nil if the grammar is unavailable or
 FILE cannot be read.
@@ -629,6 +651,8 @@ legitimately be nil for a file that still belongs to a package."
                            :interfaces
                            (wit-ts-mode--kinded-captures
                             root wit-ts-mode--completion-interfaces-query)
+                           :worlds
+                           (wit-ts-mode--world-names root)
                            :members
                            (wit-ts-mode--interface-members-alist root)))))))
           (when mtime
@@ -650,39 +674,53 @@ legitimately be nil for a file that still belongs to a package."
      (treesit-parser-root-node parser)
      wit-ts-mode--completion-interfaces-query)))
 
-(defun wit-ts-mode--path-candidates ()
-  "Return candidates valid after `import'/`export'/`use' (a use_path).
-Per the WIT grammar a use_path is either a bare interface name in
-the current package, or a foreign ns:pkg/interface@version path.
+(defun wit-ts-mode--path-candidates (&optional keyword)
+  "Return candidates valid after `import'/`export'/`use'/`include'.
+Per the WIT grammar a use_path is either a bare name in the
+current package, or a foreign ns:pkg/name@version path.
 Accordingly this returns:
 
-- bare interface names from files sharing the current buffer's
-  declared package id (its own interfaces plus sibling files), and
-- ns:pkg/interface@version paths for interfaces in every other
+- bare names from files sharing the current buffer's declared
+  package id (its own definitions plus sibling files), and
+- ns:pkg/name@version paths for definitions in every other
   \(foreign) package under the `wit-deps' root.
+
+KEYWORD is the introducing keyword (see `wit-ts-mode--in-use-path-p').
+It selects which definitions are offered: an `include' takes a
+world, so only worlds are returned; any other keyword (or nil)
+takes an interface, so only interfaces are returned.
 
 Return nil when the buffer is not part of a `wit-deps' project."
   (when-let* ((roots (wit-ts-mode--wit-root))
               (wit-root (car roots)))
-    (let ((own-pkg (wit-ts-mode--buffer-package-id))
-          (self (and buffer-file-name (expand-file-name buffer-file-name)))
-          ;; The buffer's own interfaces are always local, and reflect
-          ;; unsaved edits the on-disk scan would miss.
-          (locals (copy-sequence (wit-ts-mode--buffer-interfaces)))
-          foreign)
+    (let* ((own-pkg (wit-ts-mode--buffer-package-id))
+           (self (and buffer-file-name (expand-file-name buffer-file-name)))
+           ;; `include' references a world; every other keyword references
+           ;; an interface.
+           (want-kind (if (equal keyword "include") 'world 'interface))
+           ;; The buffer's own definitions are always local, and reflect
+           ;; unsaved edits the on-disk scan would miss.
+           (locals (seq-filter
+                    (lambda (c)
+                      (eq (wit-ts-mode--candidate-kind c) want-kind))
+                    (wit-ts-mode--buffer-interfaces)))
+           foreign)
       (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
         (unless (equal (expand-file-name file) self)
           (let* ((info (wit-ts-mode--parse-file file))
                  (pkg (plist-get info :package))
                  (version (plist-get info :version))
-                 (interfaces (plist-get info :interfaces)))
+                 (interfaces (seq-filter
+                              (lambda (c)
+                                (eq (wit-ts-mode--candidate-kind c) want-kind))
+                              (plist-get info :interfaces))))
             (if (and own-pkg pkg (equal pkg own-pkg))
                 ;; Same package (spec allows splitting across files): the
-                ;; interfaces are referable by bare name.
+                ;; definitions are referable by bare name.
                 (dolist (name interfaces)
                   (push name locals))
-              ;; Foreign package: only reachable as ns:pkg/interface@version.
-              ;; Preserve each interface's kind on the constructed path.
+              ;; Foreign package: only reachable as ns:pkg/name@version.
+              ;; Preserve each definition's kind on the constructed path.
               (when pkg
                 (dolist (name interfaces)
                   (push (wit-ts-mode--kinded
@@ -1011,7 +1049,10 @@ command-line arguments."
 (defconst wit-ts-mode--use-path-context-regexp
   (rx (or bos (any ?\; ?{ ?} ?\n))
       (* space)
-      (or "import" "export" "use" "include")
+      ;; Group 1 is the introducing keyword, so callers can distinguish an
+      ;; `include' (which names a world) from `import'/`export'/`use'
+      ;; (which name an interface).
+      (group (or "import" "export" "use" "include"))
       (+ space)
       ;; The use_path itself: a single unbroken run of the characters a
       ;; path may contain -- ids plus the `:'/`/' separators and the `.'s
@@ -1026,22 +1067,25 @@ Matched against the buffer text from the enclosing statement's
 start to point; a match means point sits in a use_path position.")
 
 (defun wit-ts-mode--in-use-path-p ()
-  "Return non-nil when point is in an `import'/`export'/`use' path.
-Detected textually from the text preceding point, which is robust
-to the incomplete (ERROR-node) parses produced while typing such a
-statement."
-  (let ((line-start (line-beginning-position)))
-    ;; Scan from the enclosing statement's start.  `import'/`use' bodies do
-    ;; not span lines in practice, so bounding the search at the line start
-    ;; keeps it cheap; the regexp still anchors on `;'/`{'/`}' within it.
-    (string-match-p wit-ts-mode--use-path-context-regexp
-                    (buffer-substring-no-properties
-                     (max (point-min)
-                          (save-excursion
-                            (or (re-search-backward "[;{}]" line-start t)
-                                (goto-char line-start))
-                            (point)))
-                     (point)))))
+  "Return the introducing keyword when point is in a use_path, else nil.
+The keyword is one of \"import\"/\"export\"/\"use\"/\"include\"
+\(all non-nil, so this doubles as a predicate).  Detected textually
+from the text preceding point, which is robust to the incomplete
+\(ERROR-node) parses produced while typing such a statement."
+  (let* ((line-start (line-beginning-position))
+         ;; Scan from the enclosing statement's start.  `import'/`use'
+         ;; bodies do not span lines in practice, so bounding the search at
+         ;; the line start keeps it cheap; the regexp still anchors on
+         ;; `;'/`{'/`}' within it.
+         (text (buffer-substring-no-properties
+                (max (point-min)
+                     (save-excursion
+                       (or (re-search-backward "[;{}]" line-start t)
+                           (goto-char line-start))
+                       (point)))
+                (point))))
+    (when (string-match wit-ts-mode--use-path-context-regexp text)
+      (match-string 1 text))))
 
 (defun wit-ts-mode--use-names-list-open ()
   "If point is in a `use PATH.{ ... }' names list, return (PATH . OPEN).
@@ -1149,10 +1193,10 @@ Context-sensitive: after `@' it completes feature-gate attributes
 `use PATH.{ ... }' names list, completes the target interface's
 type and resource members (see `wit-ts-mode--member-candidates').
 In an `import'/`export'/`use' path, completes local interface
-names and foreign package paths (see `wit-ts-mode--path-candidates').
-Otherwise completes WIT keywords, builtin types, and identifiers
-defined in the current buffer.  Suitable for
-`completion-at-point-functions'."
+names and foreign package paths; in an `include' path, only worlds
+\(see `wit-ts-mode--path-candidates').  Otherwise completes WIT
+keywords, builtin types, and identifiers defined in the current
+buffer.  Suitable for `completion-at-point-functions'."
   (let ((node (treesit-node-at (point))))
     ;; Do not complete inside comments or string literals.
     (unless (wit-ts-mode--in-comment-or-string-p node)
@@ -1175,7 +1219,8 @@ defined in the current buffer.  Suitable for
                (lambda ()
                  (cond (gate-context (wit-ts-mode--gate-candidates gate-context))
                        (names-context (wit-ts-mode--member-candidates))
-                       (path-context (wit-ts-mode--path-candidates))
+                       (path-context (wit-ts-mode--path-candidates
+                                      path-context))
                        (t (wit-ts-mode--completion-candidates)))))
               :exclusive 'no
               ;; Surface each candidate's WIT kind: as trailing text in the
@@ -1678,51 +1723,72 @@ e.g. `use path.{errno}'"
 
 (defun wit-ts-mode--project-package-index ()
   "Return an index of the project's packages, or nil outside a project.
-The index is an alist mapping each package id to an alist of its
-interfaces, mapping interface name to its member (type/resource)
-names.  The current buffer is read live (honouring unsaved edits);
-other files come from the mtime-cached `wit-ts-mode--parse-file'.
-Definitions for one package may be spread across several files, so
-per-package interface alists are merged."
+The index is an alist mapping each package id to a plist with keys
+`:interfaces' (an alist mapping interface name to its member
+type/resource names) and `:worlds' (the list of world names).
+Interfaces resolve `use'/`import'/`export' paths; worlds resolve
+`include' paths.  The current buffer is read live (honouring
+unsaved edits); other files come from the mtime-cached
+`wit-ts-mode--parse-file'.  Definitions for one package may be
+spread across several files, so their interfaces and worlds are
+merged."
   (when-let* ((roots (wit-ts-mode--wit-root))
               (wit-root (car roots)))
     (let ((index (make-hash-table :test 'equal))
           (self (and buffer-file-name (expand-file-name buffer-file-name))))
-      (cl-flet ((add (pkg ifaces)
+      (cl-flet ((add (pkg ifaces worlds)
                   (when pkg
-                    (setf (gethash pkg index)
-                          (append ifaces (gethash pkg index))))))
+                    (let ((entry (gethash pkg index)))
+                      (setf (gethash pkg index)
+                            (list :interfaces
+                                  (append ifaces (plist-get entry :interfaces))
+                                  :worlds
+                                  (append worlds
+                                          (plist-get entry :worlds))))))))
         ;; Current buffer, live.
         (when-let* ((parser (wit-ts-mode--parser)))
-          (add (wit-ts-mode--buffer-package-id)
-               (wit-ts-mode--interface-members-alist
-                (treesit-parser-root-node parser))))
+          (let ((root (treesit-parser-root-node parser)))
+            (add (wit-ts-mode--buffer-package-id)
+                 (wit-ts-mode--interface-members-alist root)
+                 (wit-ts-mode--world-names root))))
         ;; Every other file under the wit-deps root.
         (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
           (unless (equal (expand-file-name file) self)
             (let ((info (wit-ts-mode--parse-file file)))
-              (add (plist-get info :package) (plist-get info :members))))))
-      ;; Materialise as an alist so callers can `assoc' packages/interfaces.
+              (add (plist-get info :package)
+                   (plist-get info :members)
+                   (plist-get info :worlds))))))
+      ;; Materialise as an alist so callers can `assoc' packages.
       (let (result)
-        (maphash (lambda (pkg ifaces) (push (cons pkg ifaces) result)) index)
+        (maphash (lambda (pkg entry) (push (cons pkg entry) result)) index)
         result))))
 
 (defun wit-ts-mode--reference-diagnostic (source path-node index)
   "Return a warning diagnostic for the use_path PATH-NODE, or nil.
 Resolves the path against INDEX (see
 `wit-ts-mode--project-package-index'): warns when the referenced
-package is absent, or the interface is not defined in it (or, for a
-bare local path, not defined in the current package).  Members of a
-`use PATH.{ ... }' list are checked separately.  SOURCE is the
-buffer the diagnostic is anchored in."
+package is absent, or the named definition is not defined in it
+\(or, for a bare local path, not defined in the current package).
+The expected kind depends on the enclosing statement: an
+`include' path names a world, while a `use'/`import'/`export'
+path names an interface.  Members of a `use PATH.{ ... }' list are
+checked separately.  SOURCE is the buffer the diagnostic is
+anchored in."
   (let* ((path (treesit-node-text path-node t))
          (split (wit-ts-mode--split-use-path path))
          (package (car split))
-         (interface (cdr split))
+         (name (cdr split))
          (own-pkg (wit-ts-mode--buffer-package-id))
          ;; A bare path resolves within the current package.
          (target-pkg (or package own-pkg))
-         (pkg-entry (and target-pkg (assoc target-pkg index))))
+         (pkg-entry (and target-pkg (assoc target-pkg index)))
+         ;; `include' names a world; everything else names an interface.
+         (world-ref (equal (treesit-node-type (treesit-node-parent path-node))
+                           "include_item"))
+         (kind (if world-ref "World" "Interface"))
+         (defined (if world-ref
+                      (member name (plist-get (cdr pkg-entry) :worlds))
+                    (assoc name (plist-get (cdr pkg-entry) :interfaces)))))
     (cond
      ;; Foreign package not present anywhere in the project (e.g. deps not
      ;; fetched, or a typo'd package id).
@@ -1732,14 +1798,14 @@ buffer the diagnostic is anchored in."
        (format "Unknown package `%s' (run `%s' to fetch dependencies?)"
                package wit-ts-deps-executable)
        :warning))
-     ;; Package known but the interface is not defined in it.
-     ((and pkg-entry (not (assoc interface (cdr pkg-entry))))
+     ;; Package known but the interface/world is not defined in it.
+     ((and pkg-entry (not defined))
       (wit-ts-mode--flymake-diag
        source path-node
        (if package
-           (format "Interface `%s' is not defined in package `%s'"
-                   interface package)
-         (format "Interface `%s' is not defined in this package" interface))
+           (format "%s `%s' is not defined in package `%s'"
+                   kind name package)
+         (format "%s `%s' is not defined in this package" kind name))
        :warning)))))
 
 (defun wit-ts-mode--use-names-item-name-node (item)
@@ -1768,7 +1834,8 @@ SOURCE is the buffer the diagnostics are anchored in."
                       (treesit-node-text path-node t)))
               (target-pkg (or (car split) (wit-ts-mode--buffer-package-id)))
               (pkg-entry (assoc target-pkg index))
-              (iface-entry (assoc (cdr split) (cdr pkg-entry)))
+              (iface-entry (assoc (cdr split)
+                                  (plist-get (cdr pkg-entry) :interfaces)))
               ;; Members are kinded strings; compare by plain text.
               (members (mapcar #'substring-no-properties (cdr iface-entry))))
     (let (diags)

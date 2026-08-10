@@ -7,3 +7,9 @@ interface dep-iface {
 
     gadget: func() -> widget;
 }
+
+// A world in the dependency package, exercised by `include' path
+// resolution and completion (which accept a world, not an interface).
+world dep-world {
+    export dep-iface;
+}

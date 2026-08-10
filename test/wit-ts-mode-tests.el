@@ -464,6 +464,46 @@ are fetched."
       (should (member "example:dep/dep-iface@0.1.0" cands))
       (should-not (member "dep-iface" cands)))))
 
+(ert-deftest wit-ts-mode-path-candidates-include-offers-only-worlds ()
+  "An `include' path offers worlds, never interfaces."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((cands (wit-ts-mode--path-candidates "include")))
+      ;; The dependency package's world -- full path with version.
+      (should (member "example:dep/dep-world@0.1.0" cands))
+      ;; Interfaces must NOT appear after `include'.
+      (should-not (member "example:dep/dep-iface@0.1.0" cands))
+      (should-not (member "app" cands))
+      (should-not (member "sibling-iface" cands)))))
+
+(ert-deftest wit-ts-mode-path-candidates-use-offers-only-interfaces ()
+  "An `import'/`export'/`use' path offers interfaces, never worlds."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (dolist (keyword '("import" "export" "use"))
+      (let ((cands (wit-ts-mode--path-candidates keyword)))
+        (should (member "example:dep/dep-iface@0.1.0" cands))
+        (should (member "app" cands))
+        ;; The dependency package's world must NOT appear.
+        (should-not (member "example:dep/dep-world@0.1.0" cands))))))
+
+(ert-deftest wit-ts-mode-include-context-offers-worlds ()
+  "The capf, after `include', offers worlds and filters out interfaces."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  include ")
+    (should (equal (wit-ts-mode--in-use-path-p) "include"))
+    (let* ((capf (wit-ts-mode-completion-at-point))
+           (cands (all-completions "" (nth 2 capf))))
+      (should (member "example:dep/dep-world@0.1.0" cands))
+      (should-not (member "example:dep/dep-iface@0.1.0" cands)))))
+
+(ert-deftest wit-ts-mode-in-use-path-returns-keyword ()
+  "`wit-ts-mode--in-use-path-p' returns the introducing keyword."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (dolist (keyword '("import" "export" "use" "include"))
+      (goto-char (point-max))
+      (insert (format "\nworld probe {\n  %s " keyword))
+      (should (equal (wit-ts-mode--in-use-path-p) keyword)))))
+
 (ert-deftest wit-ts-mode-path-candidates-nil-without-project ()
   "`wit-ts-mode--path-candidates' returns nil outside a wit-deps project."
   (skip-unless (treesit-ready-p 'wit t))
@@ -860,6 +900,38 @@ EXTRA, if given, is appended to the buffer before checking."
                texts))
       ;; The valid member `widget' is not flagged.
       (should-not (seq-some (lambda (m) (string-match-p "`widget'" m)) texts)))))
+
+(ert-deftest wit-ts-mode-reference-include-of-world-clean ()
+  "`include' of a world defined in a dependency package is not flagged.
+Regression: `include ns:pkg/world' must resolve against the
+package's worlds, not its interfaces (a world is not an interface)."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((before (length (wit-ts-mode-tests--reference-texts)))
+          (after (length (wit-ts-mode-tests--reference-texts
+                          "\nworld w {\n  include example:dep/dep-world@0.1.0;\n}\n"))))
+      (should (= before after)))))
+
+(ert-deftest wit-ts-mode-reference-include-of-interface-flagged ()
+  "`include' of an interface (not a world) is flagged as a world reference."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  "\nworld w {\n  include example:dep/dep-iface@0.1.0;\n}\n")))
+      (should (seq-some
+               (lambda (m)
+                 (string-match-p
+                  "World `dep-iface' is not defined in package `example:dep'" m))
+               texts)))))
+
+(ert-deftest wit-ts-mode-reference-import-of-world-flagged ()
+  "`import' of a world (not an interface) is flagged as an interface reference."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((texts (wit-ts-mode-tests--reference-texts
+                  "\nworld w {\n  import example:dep/dep-world@0.1.0;\n}\n")))
+      (should (seq-some
+               (lambda (m)
+                 (string-match-p
+                  "Interface `dep-world' is not defined in package `example:dep'" m))
+               texts)))))
 
 (ert-deftest wit-ts-mode-reference-unknown-param-type ()
   "A function parameter whose type is undefined is flagged."
