@@ -37,11 +37,13 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'treesit)
 (require 'hideshow)
 (require 'flymake)
 (require 'outline)
 (require 'seq)
+(require 'xref)
 
 (declare-function treesit-parser-create "treesit.c")
 (declare-function treesit-node-type "treesit.c")
@@ -109,6 +111,87 @@ run `M-x treesit-install-language-grammar RET wit RET'")))
   "Number of spaces for each indentation step in `wit-ts-mode'."
   :type 'natnum
   :safe #'natnump
+  :group 'wit-ts)
+
+(defcustom wit-ts-deps-executable "wit-deps"
+  "Program used to resolve WIT dependencies with a `deps.toml' manifest.
+Chosen by the default `wit-ts-deps-tool-function' for projects with
+a `deps.toml'; `wit-ts-deps-sync' invokes it bare and
+`wit-ts-deps-update' as `wit-deps update'.  Looked up with
+`executable-find' on the variable `exec-path', so a bare program
+name or an absolute path both work."
+  :type 'string
+  :group 'wit-ts)
+
+(defcustom wit-ts-wkg-executable "wkg"
+  "Program used to resolve WIT dependencies with wasm-pkg-tools.
+Chosen by the default `wit-ts-deps-tool-function' for projects
+without a `deps.toml' manifest; `wit-ts-deps-sync' invokes it as
+`wkg fetch' and `wit-ts-deps-update' as `wkg update'.  Looked up
+with `executable-find' on the variable `exec-path', so a bare
+program name or an absolute path both work."
+  :type 'string
+  :group 'wit-ts)
+
+(defcustom wit-ts-bindgen-executable "wit-bindgen"
+  "Program used to generate language bindings from WIT.
+Invoked by `wit-ts-generate' for `wit-deps' projects.  Looked up
+with `executable-find' on the variable `exec-path', so a bare
+program name or an absolute path both work."
+  :type 'string
+  :group 'wit-ts)
+
+(defcustom wit-ts-cargo-component-executable "cargo-component"
+  "Program used to build a WebAssembly component with cargo-component.
+Invoked by `wit-ts-generate' for `wkg' projects, as `cargo-component
+build': it regenerates the component's bindings and builds it.
+Looked up with `executable-find' on the variable `exec-path', so a
+bare program name or an absolute path both work."
+  :type 'string
+  :group 'wit-ts)
+
+(defcustom wit-ts-deps-directory "wit"
+  "Name of the WIT directory, relative to the project root.
+Holds the project's `.wit' sources, with resolved dependencies
+under DIR/deps/ and, for `wit-deps' projects, a DIR/deps.toml
+manifest.  `wit' is the tools' default but is configurable, so
+`wit-ts-mode' does not hardcode it."
+  :type 'string
+  :group 'wit-ts)
+
+(defcustom wit-ts-deps-tool-function #'wit-ts-mode--default-deps-tool
+  "Function that selects the dependency tool for the current project.
+Called with one argument, WIT-ROOT (the `wit-ts-deps-directory' as
+an absolute directory name), and must return one of the symbols
+`wit-deps' or `wkg' -- the tool `wit-ts-deps-sync' and
+`wit-ts-deps-update' should drive.
+
+The default, `wit-ts-mode--default-deps-tool', returns `wit-deps'
+when WIT-ROOT contains a `deps.toml' manifest and `wkg'
+otherwise.  Override it to force one tool, or to key the choice on
+some other project marker."
+  :type 'function
+  :group 'wit-ts)
+
+(defcustom wit-ts-mode-deps-read-only t
+  "When non-nil, visit dependency `.wit' files read-only.
+Files under the `wit-deps'-managed DIR/deps/ directory are fetched
+artifacts, not sources to edit (e.g. those reached by jumping to a
+definition).  Set to nil to allow editing them."
+  :type 'boolean
+  :group 'wit-ts)
+
+(defcustom wit-ts-mode-check-references t
+  "When non-nil, Flymake warns about unresolved WIT references.
+Checks that every type reference (in a `type' alias, record field,
+variant payload, function signature, and so on) resolves to a
+builtin, a locally-defined type, or a `use'-imported name.  In a
+`wit-deps' project (see `wit-ts-mode--wit-root') it additionally
+checks that the interface named in an `import'/`export'/`use' path
+exists (locally or in the referenced package under DIR/deps/) and
+that the members of a `use PATH.{ ... }' list are defined in that
+interface.  Requires `flymake-mode' to show results."
+  :type 'boolean
   :group 'wit-ts)
 
 ;;; Indentation
@@ -257,34 +340,699 @@ Most WIT declarations store their name in the `name' field; a
     "tuple" "list" "option" "result" "map" "borrow" "future" "stream")
   "WIT builtin and predefined type constructors offered for completion.")
 
+(defconst wit-ts-mode--gates
+  '("since" "unstable" "deprecated")
+  "WIT feature-gate attribute names offered after `@'.
+See the WIT spec's feature-gate grammar: `@since(version = ...)',
+`@unstable(feature = ...)', `@deprecated(version = ...)'.")
+
+(defconst wit-ts-mode--gate-fields
+  '(("since"      . "version")
+    ("deprecated" . "version")
+    ("unstable"   . "feature"))
+  "Alist mapping a WIT feature gate to the field name it takes.
+`@since'/`@deprecated' take `version = <semver>'; `@unstable'
+takes `feature = <id>' (per the WIT feature-gate grammar).")
+
+(defconst wit-ts-mode--kind-property 'wit-ts-mode--kind
+  "Text property naming the WIT kind of a completion candidate.
+The value is a symbol such as `interface', `world', `record',
+`enum', `flags', `variant', `resource', `type', `func',
+`package', `keyword' or `builtin'.")
+
+(defconst wit-ts-mode--kind-annotations
+  '((interface . " interface")
+    (world     . " world")
+    (record    . " record")
+    (enum      . " enum")
+    (flags     . " flags")
+    (variant   . " variant")
+    (resource  . " resource")
+    (type      . " type")
+    (func      . " func")
+    (package   . " package")
+    (keyword   . " keyword")
+    (builtin   . " builtin type")
+    (gate      . " feature gate")
+    (field     . " gate field"))
+  "Alist mapping a candidate's WIT kind to its completion annotation.
+The annotation is the text shown after a candidate in the
+completion UI (e.g. the `*Completions*' buffer).")
+
+(defconst wit-ts-mode--kind-company-kinds
+  '((interface . interface)
+    (world     . module)
+    (record    . struct)
+    (enum      . enum)
+    (flags     . enum)
+    (variant   . enum)
+    (resource  . class)
+    (type      . type-parameter)
+    (func      . function)
+    (package   . module)
+    (keyword   . keyword)
+    (builtin   . type-parameter)
+    (gate      . keyword)
+    (field     . property))
+  "Alist mapping a candidate's WIT kind to a Company/Corfu `kind' symbol.
+These symbols select the icon shown by frontends that support the
+`company-kind' completion property (e.g. Corfu, Company).")
+
+(defun wit-ts-mode--kinded (name kind)
+  "Return NAME as a completion candidate carrying its WIT KIND.
+KIND is stored in the `wit-ts-mode--kind-property' text property;
+it is ignored by `equal' and completion matching but read back by
+the completion annotation and `company-kind' functions."
+  (propertize name wit-ts-mode--kind-property kind))
+
+(defun wit-ts-mode--candidate-kind (candidate)
+  "Return the WIT kind symbol of completion CANDIDATE, or nil."
+  (and (> (length candidate) 0)
+       (get-text-property 0 wit-ts-mode--kind-property candidate)))
+
 (defconst wit-ts-mode--completion-defs-query
-  '((interface_item name: (id) @n)
-    (world_item name: (id) @n)
-    (record_item name: (id) @n)
-    (variant_items name: (id) @n)
-    (enum_items name: (id) @n)
-    (flags_items name: (id) @n)
-    (resource_item name: (id) @n)
-    (type_item alias: (id) @n)
-    (func_item name: (id) @n))
-  "Tree-sitter query capturing names of top-level WIT definitions.")
+  ;; Each capture is named after the WIT kind it matches, so a single
+  ;; `treesit-query-capture' yields both the name and its kind.
+  '((interface_item name: (id) @interface)
+    (world_item name: (id) @world)
+    (record_item name: (id) @record)
+    (variant_items name: (id) @variant)
+    (enum_items name: (id) @enum)
+    (flags_items name: (id) @flags)
+    (resource_item name: (id) @resource)
+    (type_item alias: (id) @type)
+    (func_item name: (id) @func))
+  "Tree-sitter query capturing names of top-level WIT definitions.
+Each capture name is the WIT kind of the matched definition (see
+`wit-ts-mode--kinded'), so callers can label candidates by kind.")
+
+(defun wit-ts-mode--kinded-captures (root query)
+  "Return kinded candidate strings for QUERY captured under ROOT.
+Each capture name in QUERY is taken to be the candidate's WIT kind
+\(a symbol); the captured node's text becomes the candidate, tagged
+with that kind via `wit-ts-mode--kinded'.  Duplicates are removed."
+  (let (seen result)
+    (dolist (cap (treesit-query-capture root query nil nil nil))
+      (let ((name (treesit-node-text (cdr cap) t)))
+        (unless (member name seen)
+          (push name seen)
+          (push (wit-ts-mode--kinded name (car cap)) result))))
+    (nreverse result)))
+
+(defconst wit-ts-mode--completion-packages-query
+  '((package_decl (decl_head) @h))
+  "Tree-sitter query capturing the `decl_head' of package declarations.
+A `decl_head' spells out the package id, e.g. the tokens of
+\"package wasi:http@0.2.10;\" (see the WIT grammar's `decl_head',
+`_uri_head' and `_uri_tail' rules).")
+
+(defun wit-ts-mode--package-id-from-decl-head (node)
+  "Reconstruct a package id from a `decl_head' NODE, or nil.
+Per the WIT grammar a `decl_head' is `package' followed by
+namespace/name id tokens joined by `:' and `/', then an optional
+@version.  Concatenate the id and separator tokens (dropping the
+`package' keyword and the version), yielding e.g. \"wasi:http\"."
+  (let (parts done)
+    (dotimes (i (treesit-node-child-count node))
+      (unless done
+        (let ((type (treesit-node-type (treesit-node-child node i))))
+          (cond
+           ((member type '("id" ":" "/"))
+            (push (treesit-node-text (treesit-node-child node i) t) parts))
+           ((member type '("@" "version"))
+            (setq done t))))))
+    (when parts
+      (apply #'concat (nreverse parts)))))
+
+(defun wit-ts-mode--package-version-from-decl-head (node)
+  "Return the @version string of a `decl_head' NODE, or nil.
+E.g. \"0.2.10\" for \"package wasi:http@0.2.10;\"."
+  (let (version)
+    (dotimes (i (treesit-node-child-count node))
+      (let ((child (treesit-node-child node i)))
+        (when (equal (treesit-node-type child) "version")
+          (setq version (treesit-node-text child t)))))
+    version))
+
+(defconst wit-ts-mode--completion-interfaces-query
+  ;; Capture names double as WIT kinds (see `wit-ts-mode--kinded-captures').
+  '((interface_item name: (id) @interface)
+    (world_item name: (id) @world))
+  "Tree-sitter query capturing interface and world names.
+These are the definitions an `import'/`export'/`use' path may
+refer to (by bare name within a package, or as ns:pkg/NAME across
+packages).")
+
+(defconst wit-ts-mode--completion-members-query
+  ;; Capture names double as WIT kinds (see `wit-ts-mode--kinded-captures').
+  '((type_item alias: (id) @type)
+    (record_item name: (id) @record)
+    (variant_items name: (id) @variant)
+    (enum_items name: (id) @enum)
+    (flags_items name: (id) @flags)
+    (resource_item name: (id) @resource))
+  "Tree-sitter query capturing an interface's `use'-able members.
+Per the WIT spec a `use interface.{ ... }' names list may only
+refer to types and resources, never functions, so `func_item' is
+deliberately absent here.  Each capture name is the member's WIT
+kind.")
+
+(defun wit-ts-mode--interface-members-alist (root)
+  "Return an alist mapping each interface name under ROOT to its members.
+Each value is the list of type/resource names defined directly in
+that interface (see `wit-ts-mode--completion-members-query'), as
+kinded candidates -- the identifiers valid in a
+`use interface.{ ... }' list."
+  (let (alist)
+    (dolist (iface (treesit-query-capture root '((interface_item) @i) nil nil t))
+      (when-let* ((name-node (treesit-node-child-by-field-name iface "name")))
+        (push (cons (treesit-node-text name-node t)
+                    (wit-ts-mode--kinded-captures
+                     iface wit-ts-mode--completion-members-query))
+              alist)))
+    alist))
+
+(defconst wit-ts-mode--world-name-query
+  '((world_item name: (id) @world))
+  "Tree-sitter query capturing the names of world definitions.
+These are the definitions an `include' path may refer to (by bare
+name within a package, or as ns:pkg/NAME across packages); a
+plain `use'/`import'/`export' path refers to an interface.")
+
+(defun wit-ts-mode--world-names (root)
+  "Return the plain names of worlds defined under ROOT, deduplicated.
+Unlike interfaces, worlds have no `use'-able members, so only
+their names are collected (the identifiers valid after
+`include')."
+  (let (seen)
+    (dolist (cap (treesit-query-capture root wit-ts-mode--world-name-query
+                                        nil nil nil))
+      (let ((name (treesit-node-text (cdr cap) t)))
+        (unless (member name seen)
+          (push name seen))))
+    (nreverse seen)))
 
 (defun wit-ts-mode--buffer-definitions ()
-  "Return a list of identifier names defined in the current buffer.
+  "Return the definitions of the current buffer as kinded candidates.
 Collected from the tree-sitter parse tree (interfaces, worlds, and
-the various type and function definitions)."
+the various type and function definitions), each tagged with its
+WIT kind (see `wit-ts-mode--kinded')."
   (when-let* ((parser (wit-ts-mode--parser)))
-    (delete-dups
-     (mapcar (lambda (node) (treesit-node-text node t))
-             (treesit-query-capture
-              (treesit-parser-root-node parser)
-              wit-ts-mode--completion-defs-query nil nil t)))))
+    (wit-ts-mode--kinded-captures
+     (treesit-parser-root-node parser)
+     wit-ts-mode--completion-defs-query)))
 
 (defun wit-ts-mode--completion-candidates ()
-  "Return all completion candidates: keywords, builtins, definitions."
-  (append wit-ts-mode--keywords
-          wit-ts-mode--builtin-types
+  "Return the default completion candidates: keywords, builtins, and defs.
+These are offered in ordinary (non-import) contexts: WIT keywords,
+builtin types, and the definitions of the current buffer.  Each
+candidate is tagged with its WIT kind (see `wit-ts-mode--kinded').
+
+Cross-file symbols are deliberately excluded here: names from
+other packages are only meaningful in an `import'/`export'/`use'
+path, where `wit-ts-mode--path-candidates' supplies them."
+  (append (mapcar (lambda (k) (wit-ts-mode--kinded k 'keyword))
+                  wit-ts-mode--keywords)
+          (mapcar (lambda (b) (wit-ts-mode--kinded b 'builtin))
+                  wit-ts-mode--builtin-types)
           (wit-ts-mode--buffer-definitions)))
+
+;;; Cross-file symbols
+
+;; Real WIT projects span several files: sibling files within one package and
+;; foreign packages pulled in via `use'/`import'.  There is no WIT language
+;; server, so symbols outside the current buffer are otherwise invisible.  A
+;; dependency tool (`wit-deps' or `wkg') resolves declared dependencies into
+;; DIR/deps/ on disk; once the sources are there we parse them with the same
+;; tree-sitter grammar the mode already loads and fold their definitions into
+;; completion.
+
+(defun wit-ts-mode--wit-root ()
+  "Locate the WIT directory for the current buffer.
+Return a cons (WIT-ROOT . PROJECT-ROOT), where WIT-ROOT is the
+`wit-ts-deps-directory' that holds the project's `.wit' sources
+\(with resolved dependencies under WIT-ROOT/deps/) and
+PROJECT-ROOT is its parent, the directory in which the dependency
+tool runs.  Return nil when the buffer is not visiting a file
+under such a directory.
+
+WIT-ROOT is the nearest ancestor of the buffer's file whose name
+is `wit-ts-deps-directory' (\"wit\" by default).  A `deps.toml' is
+not required, so projects managed by either `wit-deps' or `wkg'
+are recognised; which tool applies is decided later, per
+`wit-ts-deps-tool-function'."
+  (when-let* ((file buffer-file-name)
+              (start (file-name-directory (expand-file-name file))))
+    (let (root)
+      (locate-dominating-file
+       start
+       (lambda (dir)
+         (when (equal (file-name-nondirectory (directory-file-name dir))
+                      wit-ts-deps-directory)
+           (setq root (file-name-as-directory (expand-file-name dir)))
+           t)))
+      (when root
+        (cons root (file-name-directory (directory-file-name root)))))))
+
+(defun wit-ts-mode--in-deps-directory-p ()
+  "Return non-nil if the current buffer's file is under DIR/deps/.
+That is the `wit-deps'-managed dependency directory (see
+`wit-ts-mode--wit-root'), whose files are fetched artifacts."
+  (when-let* ((file buffer-file-name)
+              (roots (wit-ts-mode--wit-root))
+              (deps (expand-file-name "deps/" (car roots))))
+    (file-in-directory-p (expand-file-name file) deps)))
+
+(defvar wit-ts-mode--definitions-cache (make-hash-table :test 'equal)
+  "Cache of symbols parsed from off-buffer `.wit' files.
+Keyed by absolute file name; each value is a cons (MTIME . INFO)
+where INFO is the plist returned by `wit-ts-mode--parse-file' (see
+there for its keys).  A file is re-parsed only when its
+modification time changes.  Cleared by `wit-ts-deps-sync' so
+freshly fetched dependencies are picked up.")
+
+(defun wit-ts-mode--parse-file (file)
+  "Parse FILE with the `wit' grammar and return a plist of its symbols.
+The plist has keys `:package' (the declared package id, or nil),
+`:version' (the package @version, or nil), `:interfaces' (a list
+of interface and world names), `:worlds' (the list of world
+names, for resolving `include' paths) and `:members' (an alist
+mapping each interface name to its `use'-able type/resource
+members).
+Result is memoised in `wit-ts-mode--definitions-cache' keyed by
+FILE and its mtime.  Return nil if the grammar is unavailable or
+FILE cannot be read.
+
+A single WIT package may span several files and only some of them
+carry the `package' header (per the WIT spec), so `:package' can
+legitimately be nil for a file that still belongs to a package."
+  (when (treesit-ready-p 'wit t)
+    (let* ((attrs (file-attributes file))
+           (mtime (and attrs (file-attribute-modification-time attrs)))
+           (cached (gethash file wit-ts-mode--definitions-cache)))
+      (if (and cached mtime (equal (car cached) mtime))
+          (cdr cached)
+        (let ((info
+               (ignore-errors
+                 (with-temp-buffer
+                   (insert-file-contents file)
+                   (let* ((parser (treesit-parser-create 'wit))
+                          (root (treesit-parser-root-node parser))
+                          (head (car (treesit-query-capture
+                                      root
+                                      wit-ts-mode--completion-packages-query
+                                      nil nil t))))
+                     (list :package
+                           (and head (wit-ts-mode--package-id-from-decl-head
+                                      head))
+                           :version
+                           (and head (wit-ts-mode--package-version-from-decl-head
+                                      head))
+                           :interfaces
+                           (wit-ts-mode--kinded-captures
+                            root wit-ts-mode--completion-interfaces-query)
+                           :worlds
+                           (wit-ts-mode--world-names root)
+                           :members
+                           (wit-ts-mode--interface-members-alist root)))))))
+          (when mtime
+            (puthash file (cons mtime info) wit-ts-mode--definitions-cache))
+          info)))))
+
+(defun wit-ts-mode--buffer-package-id ()
+  "Return the package id declared in the current buffer, or nil."
+  (when-let* ((parser (wit-ts-mode--parser))
+              (head (car (treesit-query-capture
+                          (treesit-parser-root-node parser)
+                          wit-ts-mode--completion-packages-query nil nil t))))
+    (wit-ts-mode--package-id-from-decl-head head)))
+
+(defun wit-ts-mode--buffer-interfaces ()
+  "Return the current buffer's interface and world names, kind-tagged."
+  (when-let* ((parser (wit-ts-mode--parser)))
+    (wit-ts-mode--kinded-captures
+     (treesit-parser-root-node parser)
+     wit-ts-mode--completion-interfaces-query)))
+
+(defun wit-ts-mode--path-candidates (&optional keyword)
+  "Return candidates valid after `import'/`export'/`use'/`include'.
+Per the WIT grammar a use_path is either a bare name in the
+current package, or a foreign ns:pkg/name@version path.
+Accordingly this returns:
+
+- bare names from files sharing the current buffer's declared
+  package id (its own definitions plus sibling files), and
+- ns:pkg/name@version paths for definitions in every other
+  \(foreign) package under the `wit-deps' root.
+
+KEYWORD is the introducing keyword (see `wit-ts-mode--in-use-path-p').
+It selects which definitions are offered: an `include' takes a
+world, so only worlds are returned; any other keyword (or nil)
+takes an interface, so only interfaces are returned.
+
+Return nil when the buffer is not part of a `wit-deps' project."
+  (when-let* ((roots (wit-ts-mode--wit-root))
+              (wit-root (car roots)))
+    (let* ((own-pkg (wit-ts-mode--buffer-package-id))
+           (self (and buffer-file-name (expand-file-name buffer-file-name)))
+           ;; `include' references a world; every other keyword references
+           ;; an interface.
+           (want-kind (if (equal keyword "include") 'world 'interface))
+           ;; The buffer's own definitions are always local, and reflect
+           ;; unsaved edits the on-disk scan would miss.
+           (locals (seq-filter
+                    (lambda (c)
+                      (eq (wit-ts-mode--candidate-kind c) want-kind))
+                    (wit-ts-mode--buffer-interfaces)))
+           foreign)
+      (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
+        (unless (equal (expand-file-name file) self)
+          (let* ((info (wit-ts-mode--parse-file file))
+                 (pkg (plist-get info :package))
+                 (version (plist-get info :version))
+                 (interfaces (seq-filter
+                              (lambda (c)
+                                (eq (wit-ts-mode--candidate-kind c) want-kind))
+                              (plist-get info :interfaces))))
+            (if (and own-pkg pkg (equal pkg own-pkg))
+                ;; Same package (spec allows splitting across files): the
+                ;; definitions are referable by bare name.
+                (dolist (name interfaces)
+                  (push name locals))
+              ;; Foreign package: only reachable as ns:pkg/name@version.
+              ;; Preserve each definition's kind on the constructed path.
+              (when pkg
+                (dolist (name interfaces)
+                  (push (wit-ts-mode--kinded
+                         (concat pkg "/" name
+                                 (and version (concat "@" version)))
+                         (wit-ts-mode--candidate-kind name))
+                        foreign)))))))
+      (delete-dups (nconc (nreverse locals) (nreverse foreign))))))
+
+(defun wit-ts-mode--split-use-path (path)
+  "Split a use_path PATH into a cons (PACKAGE-ID . INTERFACE).
+For a foreign path like \"wasi:clocks/wall-clock@0.2.10\" this is
+\(\"wasi:clocks\" . \"wall-clock\"); for a bare local interface name
+like \"types\" it is (nil . \"types\").  Any @version is dropped."
+  (let* ((path (car (split-string path "@")))
+         (slash (string-search "/" path)))
+    (if slash
+        (cons (substring path 0 slash) (substring path (1+ slash)))
+      (cons nil path))))
+
+(defun wit-ts-mode--interface-members (package interface)
+  "Return the `use'-able members of INTERFACE, or nil.
+When PACKAGE is nil, INTERFACE is resolved within the current
+package: the current buffer first (honouring unsaved edits), then
+sibling files sharing the buffer's package id.  When PACKAGE is
+non-nil, INTERFACE is resolved in the foreign package with that
+id.  Members are the interface's type and resource names."
+  (or
+   ;; Current buffer (only meaningful for a local, unqualified reference).
+   (and (null package)
+        (when-let* ((parser (wit-ts-mode--parser)))
+          (cdr (assoc interface
+                      (wit-ts-mode--interface-members-alist
+                       (treesit-parser-root-node parser))))))
+   ;; Otherwise scan the project's files for the owning package/interface.
+   (when-let* ((roots (wit-ts-mode--wit-root))
+               (wit-root (car roots)))
+     (let ((own-pkg (wit-ts-mode--buffer-package-id))
+           (self (and buffer-file-name (expand-file-name buffer-file-name)))
+           result)
+       (catch 'found
+         (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
+           (unless (equal (expand-file-name file) self)
+             (let* ((info (wit-ts-mode--parse-file file))
+                    (pkg (plist-get info :package))
+                    ;; A file matches when its package equals the requested
+                    ;; one, or -- for an unqualified reference -- when it
+                    ;; shares the current buffer's package (a sibling file).
+                    (match (if package
+                               (equal pkg package)
+                             (and own-pkg (equal pkg own-pkg))))
+                    (members (and match
+                                  (cdr (assoc interface
+                                              (plist-get info :members))))))
+               (when members
+                 (setq result members)
+                 (throw 'found result))))))
+       result))))
+
+(defun wit-ts-mode--member-candidates ()
+  "Return member candidates for a `use PATH.{ ... }' names list.
+Resolves the interface named by the `use' path preceding point
+\(see `wit-ts-mode--current-use-path') and returns its type and
+resource members, excluding those already present in the brace
+list.  Return nil when the path or interface cannot be resolved."
+  (when-let* ((path (wit-ts-mode--current-use-path))
+              (split (wit-ts-mode--split-use-path path))
+              (members (wit-ts-mode--interface-members (car split)
+                                                       (cdr split))))
+    (let ((already (wit-ts-mode--use-names-already-listed)))
+      (seq-remove (lambda (m) (member m already)) members))))
+
+;;; Dependency synchronisation
+
+(defun wit-ts-mode--default-deps-tool (wit-root)
+  "Return the default dependency tool for WIT-ROOT.
+`wit-deps' when WIT-ROOT holds a `deps.toml' manifest, else `wkg'.
+This is the default value of `wit-ts-deps-tool-function'."
+  (if (file-exists-p (expand-file-name "deps.toml" wit-root))
+      'wit-deps
+    'wkg))
+
+(defun wit-ts-mode--deps-command (operation)
+  "Return the command for OPERATION in the current project, or signal.
+OPERATION is `sync' or `update'.  Locates the project's WIT root,
+asks `wit-ts-deps-tool-function' which tool to drive, and maps the
+pair to the concrete invocation.  The result is a plist with keys
+:executable (the program name), :exec-var (its custom variable,
+for error messages), :args (extra arguments), and :root (the
+project root the process should run in).
+
+Signals a `user-error' when the buffer is not under a
+`wit-ts-deps-directory' or the tool function returns an unknown
+symbol."
+  (let ((roots (wit-ts-mode--wit-root)))
+    (unless roots
+      (user-error "No `%s' directory found for this buffer"
+                  wit-ts-deps-directory))
+    (let ((tool (funcall wit-ts-deps-tool-function (car roots))))
+      (pcase tool
+        ('wit-deps
+         (list :executable wit-ts-deps-executable
+               :exec-var 'wit-ts-deps-executable
+               :args (and (eq operation 'update) '("update"))
+               :root (cdr roots)))
+        ('wkg
+         (list :executable wit-ts-wkg-executable
+               :exec-var 'wit-ts-wkg-executable
+               :args (list (if (eq operation 'update) "update" "fetch"))
+               :root (cdr roots)))
+        (_ (user-error "`wit-ts-deps-tool-function' returned unknown tool `%S'"
+                       tool))))))
+
+(defun wit-ts-mode--deps-run (operation label)
+  "Run the dependency tool for OPERATION asynchronously for this project.
+OPERATION is `sync' or `update'; LABEL names it in progress
+messages.  The tool and its arguments are resolved by
+`wit-ts-mode--deps-command' (which picks `wit-deps' or `wkg' per
+`wit-ts-deps-tool-function').  The process runs in the project
+root, streaming output to a buffer named for the executable.  On
+success the off-buffer definitions cache is cleared so the next
+completion re-scans the resolved sources.
+
+Signals a `user-error' if the buffer is not under a
+`wit-ts-deps-directory' or the chosen executable is not found."
+  (let* ((plan (wit-ts-mode--deps-command operation))
+         (executable (plist-get plan :executable))
+         (exec-var (plist-get plan :exec-var)))
+    (unless (executable-find executable)
+      (user-error "Cannot find `%s' on `exec-path'; set `%s'"
+                  executable exec-var))
+    (let* ((default-directory (plist-get plan :root))
+           (command (cons executable (plist-get plan :args)))
+           (buffer (get-buffer-create (format "*%s*" executable))))
+      (with-current-buffer buffer
+        (setq buffer-read-only nil)
+        (erase-buffer)
+        (insert (format "Running %s in %s\n\n"
+                        (mapconcat #'identity command " ")
+                        default-directory)))
+      (make-process
+       :name executable
+       :buffer buffer
+       :command command
+       :noquery t
+       :sentinel
+       (lambda (proc _event)
+         (when (memq (process-status proc) '(exit signal))
+           (if (and (eq (process-status proc) 'exit)
+                    (zerop (process-exit-status proc)))
+               (progn
+                 (clrhash wit-ts-mode--definitions-cache)
+                 (message "%s: %s complete" executable label))
+             (message "%s %s failed (exit %s); see *%s*"
+                      executable label (process-exit-status proc)
+                      executable))))))))
+
+;;;###autoload
+(defun wit-ts-deps-sync ()
+  "Resolve WIT dependencies for the current project, honouring the lock file.
+Populates the dependency directory from the manifest without
+changing pinned versions.  The tool is chosen by
+`wit-ts-deps-tool-function': by default `wit-deps' (run bare, like
+`wit-deps lock') for a project with a `deps.toml', otherwise `wkg
+fetch'.  To pull newer sources for dynamic references, use
+`wit-ts-deps-update' instead.
+
+See `wit-ts-mode--deps-run' for the execution model and the errors
+this may signal."
+  (interactive)
+  (wit-ts-mode--deps-run 'sync "sync"))
+
+;;;###autoload
+(defun wit-ts-deps-update ()
+  "Update WIT dependencies for the current project and rewrite the lock file.
+Unlike `wit-ts-deps-sync', this pulls the latest sources for
+dynamic references (such as a tracked branch).  The tool is chosen
+by `wit-ts-deps-tool-function': by default `wit-deps update' for a
+project with a `deps.toml', otherwise `wkg update'.
+
+See `wit-ts-mode--deps-run' for the execution model and the errors
+this may signal."
+  (interactive)
+  (wit-ts-mode--deps-run 'update "update"))
+
+;;; Binding / component generation
+
+(defvar wit-ts-mode--generate-args (make-hash-table :test 'equal)
+  "Session cache of generate argument strings, keyed by project root.
+Populated by `wit-ts-generate' the first time it runs in a project
+so later invocations reuse the same arguments.  Not persisted --
+it is forgotten when Emacs exits.")
+
+(defconst wit-ts-mode--bindgen-languages
+  '("rust" "c" "cpp" "go" "csharp" "moonbit" "markdown")
+  "Target languages `wit-bindgen' can generate bindings for.
+Used only to hint the `wit-ts-generate' prompt for `wit-deps'
+projects; the authoritative list is whatever the installed
+`wit-bindgen' supports.")
+
+(defun wit-ts-mode--generate-plan (roots)
+  "Return the generate plan for the project described by ROOTS.
+ROOTS is a (WIT-ROOT . PROJECT-ROOT) cons as returned by
+`wit-ts-mode--wit-root'.  The tool is chosen by
+`wit-ts-deps-tool-function' (the same choice that drives
+`wit-ts-deps-sync'): `wit-bindgen' for a `wit-deps' project,
+`cargo-component' for a `wkg' one.
+
+The result is a plist with keys :executable (the program name),
+:exec-var (its custom variable, for error messages), :prompt (the
+minibuffer prompt), :default-args (the template argument string
+pre-filled on first use), and :root (the project root the process
+should run in).
+
+Signals a `user-error' when the tool function returns an unknown
+symbol."
+  (let ((tool (funcall wit-ts-deps-tool-function (car roots)))
+        (project-root (cdr roots)))
+    (pcase tool
+      ('wit-deps
+       (let ((wit-dir (directory-file-name
+                       (file-relative-name (car roots) project-root))))
+         (list :executable wit-ts-bindgen-executable
+               :exec-var 'wit-ts-bindgen-executable
+               :prompt (format
+                        "wit-bindgen args (LANGUAGE [OPTIONS] WIT-PATH; e.g. %s): "
+                        (string-join wit-ts-mode--bindgen-languages ", "))
+               :default-args (format "rust --out-dir bindings %s" wit-dir)
+               :root project-root)))
+      ('wkg
+       (list :executable wit-ts-cargo-component-executable
+             :exec-var 'wit-ts-cargo-component-executable
+             :prompt "cargo-component args (e.g. build): "
+             :default-args "build"
+             :root project-root))
+      (_ (user-error "`wit-ts-deps-tool-function' returned unknown tool `%S'"
+                     tool)))))
+
+;;;###autoload
+(defun wit-ts-generate (&optional reconfigure)
+  "Generate bindings or build a component for the current project.
+The tool matches the one that resolves dependencies (see
+`wit-ts-deps-tool-function'): `wit-bindgen' for a `wit-deps'
+project, or `cargo-component build' for a `wkg' one.
+
+Prompts for the arguments to pass to the chosen program.  On the
+first run the prompt is pre-filled with a tool-appropriate template
+\(for `wit-bindgen', LANGUAGE [OPTIONS] WIT-PATH using the project's
+WIT directory; for `cargo-component', \"build\"); just edit it and
+confirm.  The program then runs asynchronously from the project
+root, streaming output to a buffer named for the executable.
+
+The arguments are remembered per project for the rest of the Emacs
+session, so later invocations reuse them without prompting.  With a
+prefix argument RECONFIGURE, prompt again (pre-filled with the last
+arguments) and store the new value.
+
+Signals a `user-error' if the buffer is not under a
+`wit-ts-deps-directory' or the chosen executable is not found."
+  (interactive "P")
+  (let ((roots (wit-ts-mode--wit-root)))
+    (unless roots
+      (user-error "No `%s' directory found for this buffer"
+                  wit-ts-deps-directory))
+    (let* ((plan (wit-ts-mode--generate-plan roots))
+           (executable (plist-get plan :executable))
+           (project-root (plist-get plan :root)))
+      (unless (executable-find executable)
+        (user-error "Cannot find `%s' on `exec-path'; set `%s'"
+                    executable (plist-get plan :exec-var)))
+      (let* ((remembered (gethash project-root wit-ts-mode--generate-args))
+             ;; On the first run, pre-fill the tool's template; afterwards,
+             ;; pre-fill the remembered arguments.
+             (initial (or remembered (plist-get plan :default-args)))
+             (args-string
+              (if (and remembered (not reconfigure))
+                  remembered
+                (read-string (plist-get plan :prompt) initial)))
+             (args (split-string-and-unquote args-string)))
+        (when (null args)
+          (user-error "No `%s' arguments given" executable))
+        (puthash project-root args-string wit-ts-mode--generate-args)
+        (wit-ts-mode--generate-run executable project-root args)))))
+
+(defun wit-ts-mode--generate-run (executable project-root args)
+  "Run EXECUTABLE with ARGS from PROJECT-ROOT, asynchronously.
+Streams output to a `*EXECUTABLE*' buffer, whose first line shows
+the exact command being run.  ARGS is a list of already-split
+command-line arguments."
+  (let* ((default-directory project-root)
+         (command (cons executable args))
+         (command-line (mapconcat #'shell-quote-argument command " "))
+         (buffer (get-buffer-create (format "*%s*" executable))))
+    (with-current-buffer buffer
+      (setq buffer-read-only nil)
+      (erase-buffer)
+      (insert (format "$ %s\n  (in %s)\n\n" command-line default-directory)))
+    (display-buffer buffer)
+    (message "Running: %s" command-line)
+    (make-process
+     :name executable
+     :buffer buffer
+     :command command
+     :noquery t
+     :sentinel
+     (lambda (proc _event)
+       (when (memq (process-status proc) '(exit signal))
+         (if (and (eq (process-status proc) 'exit)
+                  (zerop (process-exit-status proc)))
+             (message "%s: complete" executable)
+           (message "%s failed (exit %s); see *%s*"
+                    executable (process-exit-status proc) executable)))))))
 
 (defun wit-ts-mode--in-comment-or-string-p (node)
   "Return non-nil if NODE is, or is inside, a comment or string."
@@ -298,37 +1046,402 @@ the various type and function definitions)."
       (setq cur (treesit-node-parent cur)))
     found))
 
+(defconst wit-ts-mode--use-path-context-regexp
+  (rx (or bos (any ?\; ?{ ?} ?\n))
+      (* space)
+      ;; Group 1 is the introducing keyword, so callers can distinguish an
+      ;; `include' (which names a world) from `import'/`export'/`use'
+      ;; (which name an interface).
+      (group (or "import" "export" "use" "include"))
+      (+ space)
+      ;; The use_path itself: a single unbroken run of the characters a
+      ;; path may contain -- ids plus the `:'/`/' separators and the `.'s
+      ;; of an `@version'.  Whitespace is excluded, so the inline
+      ;; `import NAME: extern-type' form (space after `:') breaks the run
+      ;; and falls through to default completion, as intended.  A `{' also
+      ;; breaks it, ending the path before a `use PATH.{...}' names body.
+      (* (any alnum ?_ ?% ?: ?/ ?@ ?- ?.))
+      eos)
+  "Regexp matching an `import'/`export'/`use'/`include' path up to point.
+Matched against the buffer text from the enclosing statement's
+start to point; a match means point sits in a use_path position.")
+
+(defun wit-ts-mode--in-use-path-p ()
+  "Return the introducing keyword when point is in a use_path, else nil.
+The keyword is one of \"import\"/\"export\"/\"use\"/\"include\"
+\(all non-nil, so this doubles as a predicate).  Detected textually
+from the text preceding point, which is robust to the incomplete
+\(ERROR-node) parses produced while typing such a statement."
+  (let* ((line-start (line-beginning-position))
+         ;; Scan from the enclosing statement's start.  `import'/`use'
+         ;; bodies do not span lines in practice, so bounding the search at
+         ;; the line start keeps it cheap; the regexp still anchors on
+         ;; `;'/`{'/`}' within it.
+         (text (buffer-substring-no-properties
+                (max (point-min)
+                     (save-excursion
+                       (or (re-search-backward "[;{}]" line-start t)
+                           (goto-char line-start))
+                       (point)))
+                (point))))
+    (when (string-match wit-ts-mode--use-path-context-regexp text)
+      (match-string 1 text))))
+
+(defun wit-ts-mode--use-names-list-open ()
+  "If point is in a `use PATH.{ ... }' names list, return (PATH . OPEN).
+PATH is the use_path string preceding the brace and OPEN is the
+buffer position just after the opening brace.  Return nil when
+point is not within such a list (before its closing brace).
+
+Detected textually, which is robust to the incomplete
+\(ERROR-node) parse produced while typing a `use' names list."
+  (save-excursion
+    ;; The nearest preceding `{'/`}'/`;' must be the opening `{': that
+    ;; guarantees no closing brace or statement terminator sits between it
+    ;; and point.  A `use' statement stays on one logical line in practice,
+    ;; so bound the search at the previous line's start to keep it cheap.
+    (let ((bound (max (point-min) (line-beginning-position 0))))
+      (when (and (re-search-backward "[{};]" bound t)
+                 (eq (char-after) ?\{))
+        (let ((open (1+ (point))))
+          (skip-chars-backward " \t")
+          (when (eq (char-before) ?.)
+            (backward-char)
+            (let ((path-end (point)))
+              (skip-chars-backward "[:alnum:]_%:/@.-")
+              (let ((path-start (point)))
+                (skip-chars-backward " \t")
+                (when (and (< path-start path-end)
+                           (looking-back "\\(?:^\\|[^[:alnum:]_%-]\\)use"
+                                         (max (point-min) (- (point) 4))))
+                  (cons (buffer-substring-no-properties path-start path-end)
+                        open))))))))))
+
+(defun wit-ts-mode--current-use-path ()
+  "Return the use_path of the `use' names list point is in, or nil."
+  (car (wit-ts-mode--use-names-list-open)))
+
+(defun wit-ts-mode--use-names-already-listed ()
+  "Return the member names already present in the current `use' names list.
+Excludes the item currently being typed at point.  Each `x as y'
+alias contributes the imported name x."
+  (when-let* ((ctx (wit-ts-mode--use-names-list-open)))
+    (let* ((text (buffer-substring-no-properties (cdr ctx) (point)))
+           (pieces (split-string text "," t "[ \t\n]+"))
+           ;; Unless the list ends at a comma, the final piece is the
+           ;; in-progress item -- not yet \"already listed\".
+           (complete (if (string-match-p ",[ \t\n]*\\'" text)
+                         pieces
+                       (butlast pieces))))
+      (delq nil
+            (mapcar (lambda (piece)
+                      (car (split-string (string-trim piece) "[ \t]+")))
+                    complete)))))
+
+(defun wit-ts-mode--use-name-bounds ()
+  "Return the (START . END) bounds of the member name being typed at point."
+  (let (start end)
+    (save-excursion (skip-chars-backward "[:alnum:]_-") (setq start (point)))
+    (save-excursion (skip-chars-forward "[:alnum:]_-") (setq end (point)))
+    (cons start end)))
+
+(defconst wit-ts-mode--gate-name-regexp
+  (rx "@" (group (* (any alnum ?_ ?-))) eos)
+  "Regexp matching a feature-gate attribute name typed after `@'.
+Group 1 is the (possibly empty) gate name up to point, e.g. the
+`sin' of `@sin'.")
+
+(defconst wit-ts-mode--gate-field-regexp
+  (rx "@" (group (+ (any alnum ?_ ?-)))       ; the gate name
+      "(" (* (not (any ?\) ?\n)))             ; inside the parens, up to point
+      eos)
+  "Regexp matching an in-progress feature-gate field, e.g. `@since(ver'.
+Group 1 is the gate name; a match means point is inside the gate's
+parentheses (before the closing `)').")
+
+(defun wit-ts-mode--gate-context ()
+  "Return the feature-gate completion context at point, or nil.
+The result is (KIND . GATE): KIND is `gate' when point is on the
+attribute name just after `@' (GATE is then nil), or `field' when
+point is inside a gate's parentheses (GATE is the gate name, e.g.
+\"since\").  Detected textually, since a partial gate parses as an
+ERROR node."
+  (let ((line-head (buffer-substring-no-properties
+                    (line-beginning-position) (point))))
+    (cond
+     ((string-match wit-ts-mode--gate-field-regexp line-head)
+      (cons 'field (match-string 1 line-head)))
+     ((string-match wit-ts-mode--gate-name-regexp line-head)
+      (cons 'gate nil)))))
+
+(defun wit-ts-mode--gate-candidates (context)
+  "Return feature-gate candidates for CONTEXT (from `wit-ts-mode--gate-context').
+For a `gate' context, the three gate names; for a `field' context,
+the field the named gate accepts (`version' or `feature'), or nil
+when the gate is unknown."
+  (pcase context
+    (`(gate . ,_)
+     (mapcar (lambda (g) (wit-ts-mode--kinded g 'gate)) wit-ts-mode--gates))
+    (`(field . ,gate)
+     (when-let* ((field (cdr (assoc gate wit-ts-mode--gate-fields))))
+       (list (wit-ts-mode--kinded field 'field))))))
+
 (defun wit-ts-mode-completion-at-point ()
   "Completion-at-point function for `wit-ts-mode'.
-Completes WIT keywords, builtin types, and identifiers defined in
-the current buffer.  Suitable for `completion-at-point-functions'."
+Context-sensitive: after `@' it completes feature-gate attributes
+\(`since'/`unstable'/`deprecated') and their fields.  In a
+`use PATH.{ ... }' names list, completes the target interface's
+type and resource members (see `wit-ts-mode--member-candidates').
+In an `import'/`export'/`use' path, completes local interface
+names and foreign package paths; in an `include' path, only worlds
+\(see `wit-ts-mode--path-candidates').  Otherwise completes WIT
+keywords, builtin types, and identifiers defined in the current
+buffer.  Suitable for `completion-at-point-functions'."
   (let ((node (treesit-node-at (point))))
     ;; Do not complete inside comments or string literals.
     (unless (wit-ts-mode--in-comment-or-string-p node)
-      (let* ((bounds (bounds-of-thing-at-point 'symbol))
+      (let* ((gate-context (wit-ts-mode--gate-context))
+             (names-context (and (not gate-context)
+                                 (wit-ts-mode--in-use-names-list-p)))
+             ;; A names list is inside `{ ... }', so the path regexp (which
+             ;; stops at `{') never matches there; check it only otherwise.
+             (path-context (and (not gate-context) (not names-context)
+                                (wit-ts-mode--in-use-path-p)))
+             ;; `:'/`/' are part of a use_path, so widen past the default
+             ;; `symbol' bounds there; member and gate names are ordinary ids.
+             (bounds (cond (path-context (wit-ts-mode--use-path-bounds))
+                           (names-context (wit-ts-mode--use-name-bounds))
+                           (t (bounds-of-thing-at-point 'symbol))))
              (start (if bounds (car bounds) (point)))
              (end (if bounds (cdr bounds) (point))))
         (list start end
-              (completion-table-dynamic
-               (lambda (_prefix) (wit-ts-mode--completion-candidates)))
-              :exclusive 'no)))))
+              (wit-ts-mode--completion-table
+               (lambda ()
+                 (cond (gate-context (wit-ts-mode--gate-candidates gate-context))
+                       (names-context (wit-ts-mode--member-candidates))
+                       (path-context (wit-ts-mode--path-candidates
+                                      path-context))
+                       (t (wit-ts-mode--completion-candidates)))))
+              :exclusive 'no
+              ;; Surface each candidate's WIT kind: as trailing text in the
+              ;; `*Completions*' buffer, and as an icon in Corfu/Company.
+              :annotation-function #'wit-ts-mode--completion-annotation
+              :company-kind #'wit-ts-mode--candidate-company-kind)))))
+
+(defun wit-ts-mode--completion-annotation (candidate)
+  "Return the annotation string for completion CANDIDATE, or nil.
+Reads the candidate's WIT kind (see `wit-ts-mode--kinded') and
+maps it through `wit-ts-mode--kind-annotations'."
+  (cdr (assq (wit-ts-mode--candidate-kind candidate)
+             wit-ts-mode--kind-annotations)))
+
+(defun wit-ts-mode--candidate-company-kind (candidate)
+  "Return the Company/Corfu `kind' symbol for CANDIDATE, or nil.
+Reads the candidate's WIT kind (see `wit-ts-mode--kinded') and
+maps it through `wit-ts-mode--kind-company-kinds'."
+  (cdr (assq (wit-ts-mode--candidate-kind candidate)
+             wit-ts-mode--kind-company-kinds)))
+
+(defun wit-ts-mode--in-use-names-list-p ()
+  "Return non-nil when point is in a `use PATH.{ ... }' names list."
+  (and (wit-ts-mode--use-names-list-open) t))
+
+(defun wit-ts-mode--completion-table (candidate-fn)
+  "Return a completion table over the strings produced by CANDIDATE-FN.
+Candidates are sorted alphabetically, and the table advertises a
+`display-sort-function' of `identity' so that frontends preserve
+that order instead of imposing their own."
+  (lambda (string predicate action)
+    (if (eq action 'metadata)
+        '(metadata (display-sort-function . identity)
+                   (cycle-sort-function . identity))
+      (complete-with-action
+       action
+       (sort (copy-sequence (funcall candidate-fn)) #'string<)
+       string predicate))))
+
+(defun wit-ts-mode--use-path-bounds ()
+  "Return the (START . END) bounds of the use_path token around point.
+A use_path may contain `:', `/' and `@' in addition to the
+characters of an ordinary symbol, so this widens past those."
+  (save-excursion
+    (let ((end (point))
+          (start (point)))
+      (skip-chars-backward "[:alnum:]_%:/@.-")
+      (setq start (point))
+      (goto-char end)
+      (skip-chars-forward "[:alnum:]_%:/@.-")
+      (cons start (max start (point))))))
+
+;;; Cross-reference (xref)
+
+;; Jump-to-definition reuses the completion resolver's model: a definition is
+;; found either in the current buffer or in another `.wit' file under the
+;; `wit-deps' root (siblings and resolved dependencies under DIR/deps/).  The
+;; completion index stores only names, so xref re-parses to recover positions.
+
+(defconst wit-ts-mode--xref-path-property 'wit-ts-mode--xref-path
+  "Text property flagging an xref identifier as a use_path.
+When set, `wit-ts-mode--xref-find-definitions' resolves the
+identifier as an `import'/`export'/`use' path (an interface)
+rather than a bare definition name.")
+
+(defun wit-ts-mode--identifier-at-point ()
+  "Return the WIT identifier around point, or nil.
+In an `import'/`export'/`use' path (or its names list) the whole
+path is returned, tagged with `wit-ts-mode--xref-path-property' so
+it is resolved as an interface reference.  Otherwise the symbol at
+point is returned."
+  (cond
+   ;; A `use PATH.{ ... }' names list: a member name under point jumps to
+   ;; that member (a bare type/resource name); otherwise the path names the
+   ;; interface to jump to.
+   ((wit-ts-mode--in-use-names-list-p)
+    (or (thing-at-point 'symbol t)
+        (when-let* ((path (wit-ts-mode--current-use-path)))
+          (propertize path wit-ts-mode--xref-path-property t))))
+   ;; An import/export/use path position.
+   ((wit-ts-mode--in-use-path-p)
+    (let ((bounds (wit-ts-mode--use-path-bounds)))
+      (when (< (car bounds) (cdr bounds))
+        (propertize (buffer-substring-no-properties (car bounds) (cdr bounds))
+                    wit-ts-mode--xref-path-property t))))
+   (t
+    (thing-at-point 'symbol t))))
+
+(defun wit-ts-mode--definitions-in-node (root query)
+  "Return definitions captured by QUERY under ROOT as position records.
+Each record is a plist (:name NAME :kind KIND :node NODE); NODE is
+the captured name node, from which callers derive a location."
+  (mapcar (lambda (cap)
+            (list :name (treesit-node-text (cdr cap) t)
+                  :kind (car cap)
+                  :node (cdr cap)))
+          (treesit-query-capture root query nil nil nil)))
+
+(defun wit-ts-mode--xref-make-item (name kind file node)
+  "Build an `xref-item' for NAME of KIND at NODE's position in FILE.
+FILE nil means the current buffer.  A summary line prefixes the
+kind so the *xref* buffer reads, e.g., \"interface handler\"."
+  (let* ((start (treesit-node-start node))
+         (line (line-number-at-pos start))
+         (column (save-excursion (goto-char start) (current-column)))
+         (summary (format "%s %s" (or kind "def") name))
+         (location (if file
+                       (xref-make-file-location file line column)
+                     (xref-make-buffer-location (current-buffer) start))))
+    (xref-make summary location)))
+
+(defun wit-ts-mode--xref-defs-in-file (file names)
+  "Return xref items for definitions named in NAMES found in FILE.
+FILE is parsed in a temporary buffer; NAMES is a list of strings.
+Positions are resolved against a widened view of that buffer so
+`line-number-at-pos' and `current-column' are accurate."
+  (when (treesit-ready-p 'wit t)
+    (ignore-errors
+      (with-temp-buffer
+        (insert-file-contents file)
+        (let* ((parser (treesit-parser-create 'wit))
+               (root (treesit-parser-root-node parser))
+               items)
+          (dolist (def (wit-ts-mode--definitions-in-node
+                        root wit-ts-mode--completion-defs-query))
+            (when (member (plist-get def :name) names)
+              (push (wit-ts-mode--xref-make-item
+                     (plist-get def :name) (plist-get def :kind)
+                     file (plist-get def :node))
+                    items)))
+          (nreverse items))))))
+
+(defun wit-ts-mode--xref-buffer-defs (names)
+  "Return xref items for definitions named in NAMES in the current buffer."
+  (when-let* ((parser (wit-ts-mode--parser)))
+    (let (items)
+      (dolist (def (wit-ts-mode--definitions-in-node
+                    (treesit-parser-root-node parser)
+                    wit-ts-mode--completion-defs-query))
+        (when (member (plist-get def :name) names)
+          (push (wit-ts-mode--xref-make-item
+                 (plist-get def :name) (plist-get def :kind)
+                 nil (plist-get def :node))
+                items)))
+      (nreverse items))))
+
+(defun wit-ts-mode--xref-path-target (path)
+  "Return the interface NAME a use_path PATH refers to, ignoring package.
+The definition of `wasi:clocks/wall-clock@0.2.10' is the interface
+`wall-clock'; a bare `types' resolves to the interface `types'.
+A trailing `.' (the separator before a `.{ ... }' names body) is
+stripped first, so `types.' resolves to `types' too."
+  (cdr (wit-ts-mode--split-use-path
+        (string-remove-suffix "." path))))
+
+(defun wit-ts-mode--xref-find-definitions (identifier)
+  "Return a list of xref items defining IDENTIFIER.
+IDENTIFIER is what `wit-ts-mode--identifier-at-point' returned: a
+use_path (tagged with `wit-ts-mode--xref-path-property', resolved
+to its interface name) or a bare definition name.  Searches the
+current buffer first, then the other `.wit' files under the
+`wit-deps' root."
+  (when (and identifier (> (length identifier) 0))
+    (let* ((path-p (get-text-property 0 wit-ts-mode--xref-path-property
+                                      identifier))
+           (name (if path-p
+                     (wit-ts-mode--xref-path-target identifier)
+                   (substring-no-properties identifier)))
+           (names (list name))
+           (self (and buffer-file-name (expand-file-name buffer-file-name)))
+           (items (wit-ts-mode--xref-buffer-defs names)))
+      (when-let* ((roots (wit-ts-mode--wit-root))
+                  (wit-root (car roots)))
+        (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
+          (unless (equal (expand-file-name file) self)
+            (setq items
+                  (nconc items (wit-ts-mode--xref-defs-in-file file names))))))
+      items)))
+
+;; The backend is a function returning a symbol; its methods dispatch on it.
+(defun wit-ts-mode--xref-backend ()
+  "Return the xref backend symbol for `wit-ts-mode'."
+  'wit-ts-mode)
+
+(cl-defmethod xref-backend-identifier-at-point ((_backend (eql wit-ts-mode)))
+  "Return the WIT identifier at point for the `wit-ts-mode' xref backend."
+  (wit-ts-mode--identifier-at-point))
+
+(cl-defmethod xref-backend-definitions ((_backend (eql wit-ts-mode)) identifier)
+  "Return xref items defining IDENTIFIER for the `wit-ts-mode' backend."
+  (wit-ts-mode--xref-find-definitions identifier))
+
+(cl-defmethod xref-backend-identifier-completion-table
+  ((_backend (eql wit-ts-mode)))
+  "Return the buffer's definition names for `wit-ts-mode' xref completion."
+  (mapcar (lambda (def) (plist-get def :name))
+          (when-let* ((parser (wit-ts-mode--parser)))
+            (wit-ts-mode--definitions-in-node
+             (treesit-parser-root-node parser)
+             wit-ts-mode--completion-defs-query))))
 
 ;;; Folding
 
 ;; Translation of queries/folds.scm.  The grammar folds on `(body)' nodes
 ;; (the braced blocks of worlds, interfaces, records, resources, variants,
-;; ...) and on block comments.  hideshow drives this from its per-mode
-;; entry in `hs-special-modes-alist'.  That variable is obsolete as of
-;; Emacs 31.1 but still honoured (and is the only cross-version way to
-;; configure block *and* comment folding, since `hs-minor-mode' otherwise
-;; overwrites the buffer-local parameters), so the warning is suppressed.
-(defvar wit-ts-mode--hideshow-spec
-  '(wit-ts-mode "{" "}" "/[*/]" nil nil)
-  "Entry describing WIT block folds for hideshow.")
-
-(with-suppressed-warnings ((obsolete hs-special-modes-alist))
-  (unless (assq 'wit-ts-mode hs-special-modes-alist)
-    (add-to-list 'hs-special-modes-alist wit-ts-mode--hideshow-spec)))
+;; ...) and on block comments.  hideshow reads its block and comment
+;; regexps from buffer-local variables; historically these were seeded
+;; per-mode from `hs-special-modes-alist', but that variable is obsolete
+;; as of Emacs 31.1 in favour of setting the locals directly.  We set them
+;; from `hs-minor-mode-hook' (see `wit-ts-mode--setup-hideshow'), which
+;; runs after `hs-grok-mode-type' has otherwise initialised them.
+(defun wit-ts-mode--setup-hideshow ()
+  "Configure hideshow's block/comment regexps for WIT, buffer-locally.
+Sets `hs-block-start-regexp', `hs-block-end-regexp' and
+`hs-c-start-regexp' so `hs-minor-mode' folds WIT brace blocks and
+block comments.  Installed on `hs-minor-mode-hook', which runs
+after `hs-grok-mode-type', so these values are not overwritten.
+Replaces the obsolete (Emacs 31.1) `hs-special-modes-alist' entry."
+  (setq-local hs-block-start-regexp "{"
+              hs-block-end-regexp   "}"
+              hs-c-start-regexp     "/[*/]"))
 
 ;;; Outline
 
@@ -493,22 +1606,81 @@ For BOUND, MOVE, BACKWARD, and LOOKING-AT see `outline-search-function'."
   (format "Syntax error: expected %s"
           (wit-ts-mode--describe-token (treesit-node-type node))))
 
+(defun wit-ts-mode--bare-use-in-body-p (node)
+  "Return non-nil if ERROR NODE is a bare `use PATH;' in an interface/world.
+That is the shape produced when a `use' inside an interface or
+world body omits the mandatory `.{ ... }' names list: the grammar
+accepts a bare `use PATH;' only at file top level, so within a
+body it becomes an ERROR wrapping a lone `use_path'."
+  (let ((children (treesit-node-children node t)))
+    (and (equal (treesit-node-type (treesit-node-parent node)) "body")
+         (= (length children) 1)
+         (equal (treesit-node-type (car children)) "use_path"))))
+
+(defun wit-ts-mode--error-leading-keyword (node)
+  "Return the leading `import'/`export'/`include'/`use' keyword of NODE's text.
+Return nil when NODE's text does not begin with one of them.  Used
+to recognise malformed world items, whose keyword survives in the
+ERROR node's text even when the rest fails to parse."
+  (let ((text (treesit-node-text node t)))
+    (when (string-match "\\`\\(import\\|export\\|include\\|use\\)\\_>" text)
+      (match-string 1 text))))
+
 (defun wit-ts-mode--error-message (node)
   "Return a Flymake message describing ERROR NODE.
-When the offending text is short, quote it; otherwise fall back to
-a generic message."
-  (let ((snippet (wit-ts-mode--snippet node)))
-    (if (string-empty-p snippet)
-        "Syntax error: unexpected input"
-      (format "Syntax error: unexpected `%s'" snippet))))
+Recognises the common malformed `use'/`import'/`export' shapes and
+explains them; otherwise quotes the offending text (or falls back
+to a generic message when it is empty)."
+  (let* ((parent-type (treesit-node-type (treesit-node-parent node)))
+         (keyword (wit-ts-mode--error-leading-keyword node))
+         (text (treesit-node-text node t)))
+    (cond
+     ((wit-ts-mode--bare-use-in-body-p node)
+      (let ((path (treesit-node-text (car (treesit-node-children node t)) t)))
+        (format "`use' inside an interface or world needs a `.{...}' names \
+list, e.g. `%s.{name}'; a bare `use %s;' is only valid at file top level"
+                path path)))
+     ;; `import'/`export'/`include' at file top level: they are world items.
+     ((and (equal parent-type "source_file")
+           (member keyword '("import" "export" "include")))
+      (format "`%s' is only valid inside a `world' block" keyword))
+     ;; Inline `import NAME:' / `export NAME:' with no type after the colon.
+     ((and (equal parent-type "body")
+           (member keyword '("import" "export"))
+           (string-match-p ":[ \t\n]*\\'" text))
+      (format "`%s' name must be followed by a type: a `func(...)', an \
+`interface {...}', or an interface path" keyword))
+     ;; `import: ...' / `export: ...' with the name missing before the colon.
+     ((member parent-type '("import_item" "export_item"))
+      (let ((kw (if (equal parent-type "export_item") "export" "import")))
+        (format "`%s' needs a name before `:', e.g. `%s my-name: func()'"
+                kw kw)))
+     ((string-empty-p (wit-ts-mode--snippet node))
+      "Syntax error: unexpected input")
+     (t
+      (format "Syntax error: unexpected `%s'" (wit-ts-mode--snippet node))))))
 
-(defun wit-ts-mode--flymake-diag (source node message)
-  "Make a Flymake error diagnostic for NODE in SOURCE with MESSAGE.
-Zero-width nodes are widened by one character so there is
-something to underline."
+(defun wit-ts-mode--flymake-diag (source node message &optional type)
+  "Make a Flymake diagnostic for NODE in SOURCE with MESSAGE.
+TYPE is the severity (default `:error'; semantic reference checks
+use `:warning').  Zero-width nodes are widened by one character so
+there is something to underline."
   (let* ((beg (treesit-node-start node))
          (end (max (treesit-node-end node) (1+ beg))))
-    (flymake-make-diagnostic source beg end :error message)))
+    (flymake-make-diagnostic source beg end (or type :error) message)))
+
+(defun wit-ts-mode--empty-use-names-positions (root)
+  "Return the set of buffer positions of empty `use' names lists under ROOT.
+An empty `.{ }' list parses as a `use_names_item' holding only a
+missing `id'.  The synthetic missing node has no reachable parent,
+so this walks top-down (where navigation works) and records each
+empty item's start position for the diagnostics pass to recognise.
+The result is a hash table used as a set."
+  (let ((positions (make-hash-table :test 'eql)))
+    (dolist (item (treesit-query-capture root '((use_names_item) @i) nil nil t))
+      (when (string-empty-p (string-trim (treesit-node-text item t)))
+        (puthash (treesit-node-start item) t positions)))
+    positions))
 
 (defun wit-ts-mode--flymake-diagnostics (parser source)
   "Return Flymake diagnostics for parse errors in PARSER.
@@ -516,15 +1688,23 @@ Anchor them in the SOURCE buffer.  Missing nodes report the token
 the grammar expected (a missing node's type is that token, e.g.
 `}' or `;'); `ERROR' nodes quote the offending input.  The
 traversal visits anonymous nodes too, since a missing token is
-often an anonymous node."
-  (let (diags)
+often an anonymous node.  A missing `id' at the position of an
+empty `use' names list gets a tailored message instead."
+  (let* ((root (treesit-parser-root-node parser))
+         (empty-uses (wit-ts-mode--empty-use-names-positions root))
+         diags)
     (treesit-search-subtree
-     (treesit-parser-root-node parser)
+     root
      (lambda (node)
        (cond
         ((treesit-node-check node 'missing)
          (push (wit-ts-mode--flymake-diag
-                source node (wit-ts-mode--missing-message node))
+                source node
+                (if (and (equal (treesit-node-type node) "id")
+                         (gethash (treesit-node-start node) empty-uses))
+                    "Empty `use' names list: list at least one type, \
+e.g. `use path.{errno}'"
+                  (wit-ts-mode--missing-message node)))
                diags))
         ((equal (treesit-node-type node) "ERROR")
          (push (wit-ts-mode--flymake-diag
@@ -537,21 +1717,322 @@ often an anonymous node."
      t)
     (nreverse diags)))
 
+;;; Semantic reference checking
+
+;; Beyond parse errors, verify that identifiers used in import/export/use
+;; paths actually resolve: the interface must exist (locally, or in the
+;; referenced package under DIR/deps/), and a `use PATH.{ ... }' list may only
+;; name members that interface defines.  This is a spec-guided heuristic, not a
+;; full resolver, so unresolved references are reported as warnings.
+
+(defun wit-ts-mode--project-package-index ()
+  "Return an index of the project's packages, or nil outside a project.
+The index is an alist mapping each package id to a plist with keys
+`:interfaces' (an alist mapping interface name to its member
+type/resource names) and `:worlds' (the list of world names).
+Interfaces resolve `use'/`import'/`export' paths; worlds resolve
+`include' paths.  The current buffer is read live (honouring
+unsaved edits); other files come from the mtime-cached
+`wit-ts-mode--parse-file'.  Definitions for one package may be
+spread across several files, so their interfaces and worlds are
+merged."
+  (when-let* ((roots (wit-ts-mode--wit-root))
+              (wit-root (car roots)))
+    (let ((index (make-hash-table :test 'equal))
+          (self (and buffer-file-name (expand-file-name buffer-file-name))))
+      (cl-flet ((add (pkg ifaces worlds)
+                  (when pkg
+                    (let ((entry (gethash pkg index)))
+                      (setf (gethash pkg index)
+                            (list :interfaces
+                                  (append ifaces (plist-get entry :interfaces))
+                                  :worlds
+                                  (append worlds
+                                          (plist-get entry :worlds))))))))
+        ;; Current buffer, live.
+        (when-let* ((parser (wit-ts-mode--parser)))
+          (let ((root (treesit-parser-root-node parser)))
+            (add (wit-ts-mode--buffer-package-id)
+                 (wit-ts-mode--interface-members-alist root)
+                 (wit-ts-mode--world-names root))))
+        ;; Every other file under the wit-deps root.
+        (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
+          (unless (equal (expand-file-name file) self)
+            (let ((info (wit-ts-mode--parse-file file)))
+              (add (plist-get info :package)
+                   (plist-get info :members)
+                   (plist-get info :worlds))))))
+      ;; Materialise as an alist so callers can `assoc' packages.
+      (let (result)
+        (maphash (lambda (pkg entry) (push (cons pkg entry) result)) index)
+        result))))
+
+(defun wit-ts-mode--reference-diagnostic (source path-node index)
+  "Return a warning diagnostic for the use_path PATH-NODE, or nil.
+Resolves the path against INDEX (see
+`wit-ts-mode--project-package-index'): warns when the referenced
+package is absent, or the named definition is not defined in it
+\(or, for a bare local path, not defined in the current package).
+The expected kind depends on the enclosing statement: an
+`include' path names a world, while a `use'/`import'/`export'
+path names an interface.  Members of a `use PATH.{ ... }' list are
+checked separately.  SOURCE is the buffer the diagnostic is
+anchored in."
+  (let* ((path (treesit-node-text path-node t))
+         (split (wit-ts-mode--split-use-path path))
+         (package (car split))
+         (name (cdr split))
+         (own-pkg (wit-ts-mode--buffer-package-id))
+         ;; A bare path resolves within the current package.
+         (target-pkg (or package own-pkg))
+         (pkg-entry (and target-pkg (assoc target-pkg index)))
+         ;; `include' names a world; everything else names an interface.
+         (world-ref (equal (treesit-node-type (treesit-node-parent path-node))
+                           "include_item"))
+         (kind (if world-ref "World" "Interface"))
+         (defined (if world-ref
+                      (member name (plist-get (cdr pkg-entry) :worlds))
+                    (assoc name (plist-get (cdr pkg-entry) :interfaces)))))
+    (cond
+     ;; Foreign package not present anywhere in the project (e.g. deps not
+     ;; fetched, or a typo'd package id).
+     ((and package (not pkg-entry))
+      (wit-ts-mode--flymake-diag
+       source path-node
+       (format "Unknown package `%s' (run `%s' to fetch dependencies?)"
+               package wit-ts-deps-executable)
+       :warning))
+     ;; Package known but the interface/world is not defined in it.
+     ((and pkg-entry (not defined))
+      (wit-ts-mode--flymake-diag
+       source path-node
+       (if package
+           (format "%s `%s' is not defined in package `%s'"
+                   kind name package)
+         (format "%s `%s' is not defined in this package" kind name))
+       :warning)))))
+
+(defun wit-ts-mode--use-names-item-name-node (item)
+  "Return the id node naming the member imported by a `use_names_item' ITEM.
+For a plain `foo' it is the id; for an alias `foo as bar' it is the
+`path' field of the `alias_item' (the imported name, not the local
+alias).  Return nil if none is found."
+  (let ((child (treesit-node-child item 0 t)))
+    (cond
+     ((null child) nil)
+     ((equal (treesit-node-type child) "alias_item")
+      (treesit-node-child-by-field-name child "path"))
+     ((equal (treesit-node-type child) "id") child)
+     (t nil))))
+
+(defun wit-ts-mode--member-diagnostics (source use-item index)
+  "Return warning diagnostics for undefined members in a USE-ITEM.
+USE-ITEM is a `use_item' node (a `use PATH.{ ... }' statement).
+Each listed member is checked against the members INDEX reports for
+the referenced interface.  When the interface itself is unresolved,
+no member diagnostics are produced (the path diagnostic covers it).
+SOURCE is the buffer the diagnostics are anchored in."
+  (when-let* ((path-node (car (treesit-query-capture
+                               use-item '((use_path) @p) nil nil t)))
+              (split (wit-ts-mode--split-use-path
+                      (treesit-node-text path-node t)))
+              (target-pkg (or (car split) (wit-ts-mode--buffer-package-id)))
+              (pkg-entry (assoc target-pkg index))
+              (iface-entry (assoc (cdr split)
+                                  (plist-get (cdr pkg-entry) :interfaces)))
+              ;; Members are kinded strings; compare by plain text.
+              (members (mapcar #'substring-no-properties (cdr iface-entry))))
+    (let (diags)
+      (dolist (item (treesit-query-capture
+                     use-item '((use_names_item) @i) nil nil t))
+        (when-let* ((name-node (wit-ts-mode--use-names-item-name-node item))
+                    (name (treesit-node-text name-node t)))
+          (unless (or (string-empty-p name) (member name members))
+            (push (wit-ts-mode--flymake-diag
+                   source name-node
+                   (format "`%s' is not defined in interface `%s'"
+                           name (cdr split))
+                   :warning)
+                  diags))))
+      (nreverse diags))))
+
+(defconst wit-ts-mode--type-def-query
+  '((type_item alias: (id) @t)
+    (record_item name: (id) @t)
+    (variant_items name: (id) @t)
+    (enum_items name: (id) @t)
+    (flags_items name: (id) @t)
+    (resource_item name: (id) @t))
+  "Tree-sitter query capturing the names of type definitions.
+These are the names a type reference (e.g. a function parameter
+type) may resolve to within the buffer.")
+
+(defun wit-ts-mode--in-scope-type-names (root)
+  "Return the type names in scope under ROOT, as a hash-table set.
+Comprises the builtin types, every type/resource defined in the
+buffer, and the local name bound by each `use PATH.{ ... }' item
+\(its alias when one is given).  Used to decide whether a type
+reference resolves; membership is by plain name."
+  (let ((names (make-hash-table :test 'equal)))
+    (dolist (builtin wit-ts-mode--builtin-types)
+      (puthash builtin t names))
+    (dolist (node (treesit-query-capture root wit-ts-mode--type-def-query
+                                         nil nil t))
+      (puthash (treesit-node-text node t) t names))
+    ;; `use'-bound local names: the alias if present, else the imported id.
+    (dolist (item (treesit-query-capture root '((use_names_item) @i) nil nil t))
+      (when-let* ((child (treesit-node-child item 0 t))
+                  (name (pcase (treesit-node-type child)
+                          ("alias_item"
+                           (treesit-node-child-by-field-name child "alias"))
+                          ("id" child))))
+        (puthash (treesit-node-text name t) t names)))
+    names))
+
+(defun wit-ts-mode--type-ref-diagnostics (source root)
+  "Return warnings for unknown type references anywhere under ROOT.
+Every named type reference -- a function parameter or return type,
+a `type' alias's target, a record field, a variant payload, an
+element of a `list'/`option'/`result'/`tuple', a `borrow'/`own'
+handle, and so on -- is checked against the names in scope (see
+`wit-ts-mode--in-scope-type-names'); one that is neither a builtin,
+a locally-defined type, nor a `use'-imported name is flagged.
+Builtin types parse as keywords (not identifiers), so they are
+never considered.  SOURCE is the buffer the diagnostics are
+anchored in."
+  (let ((in-scope (wit-ts-mode--in-scope-type-names root))
+        diags)
+    ;; A named type reference is `(ty (id))' regardless of where it
+    ;; appears; a `borrow'/`own' handle is `(handle (id))'.  Nested
+    ;; generics recurse into inner `ty' nodes, so e.g. `list<foo>' and
+    ;; `result<ok, err>' surface `foo'/`ok'/`err'.  Definition and field
+    ;; *names* are not `(ty (id))', nor are `use_path' segments, so they
+    ;; are never caught.
+    (dolist (id (treesit-query-capture
+                 root '((ty (id) @t) (handle (id) @t)) nil nil t))
+      (let ((name (treesit-node-text id t)))
+        (unless (gethash name in-scope)
+          (push (wit-ts-mode--flymake-diag
+                 source id (format "Unknown type `%s'" name) :warning)
+                diags))))
+    (nreverse diags)))
+
+(defun wit-ts-mode--reference-diagnostics (parser source)
+  "Return semantic reference warnings for the buffer of PARSER.
+Checks that every type reference (in a `type' alias, record field,
+variant payload, function signature, and so on) resolves to a
+builtin, a locally-defined type, or a `use'-imported name.
+Additionally, in a `wit-deps' project, checks every `use_path'
+\(interface reference) and every `use PATH.{ ... }' member list
+against the project package index.  Diagnostics are anchored in the
+SOURCE buffer."
+  (when-let* ((root (treesit-parser-root-node parser)))
+    ;; Type references are checked in-buffer, so this runs even outside a
+    ;; project, where the package index (and thus `use_path' checking) is
+    ;; unavailable.
+    (let ((index (wit-ts-mode--project-package-index))
+          (diags (wit-ts-mode--type-ref-diagnostics source root)))
+      (when index
+        ;; Interface-path references.
+        (dolist (path-node (treesit-query-capture
+                            root '((use_path) @p) nil nil t))
+          (when-let* ((diag (wit-ts-mode--reference-diagnostic
+                             source path-node index)))
+            (push diag diags)))
+        ;; Names-list members (only `use_item' has a `.{ ... }' list).
+        (dolist (use-item (treesit-query-capture
+                           root '((use_item) @u) nil nil t))
+          (setq diags
+                (nconc (wit-ts-mode--member-diagnostics
+                        source use-item index)
+                       diags))))
+      diags)))
+
 (defun wit-ts-mode-flymake (report-fn &rest _args)
-  "A Flymake backend reporting WIT tree-sitter parse errors.
-REPORT-FN is called with the diagnostics, per the Flymake backend
-protocol.  Intended for `flymake-diagnostic-functions'."
+  "A Flymake backend reporting WIT tree-sitter diagnostics.
+Reports parse errors (from ERROR/MISSING nodes) and, when
+`wit-ts-mode-check-references' is non-nil, semantic warnings for
+unresolved `import'/`export'/`use' references.  REPORT-FN is
+called with the diagnostics, per the Flymake backend protocol.
+Intended for `flymake-diagnostic-functions'."
   (if-let* ((parser (or wit-ts-mode--flymake-parser
                         (wit-ts-mode--parser))))
-      (funcall report-fn
-               (wit-ts-mode--flymake-diagnostics parser (current-buffer)))
+      (let ((source (current-buffer)))
+        (funcall report-fn
+                 (append
+                  (wit-ts-mode--flymake-diagnostics parser source)
+                  (and wit-ts-mode-check-references
+                       (wit-ts-mode--reference-diagnostics parser source)))))
     (funcall report-fn nil)))
 
 ;;; Mode definition
 
+(defvar-keymap wit-ts-mode-map
+  :doc "Keymap for `wit-ts-mode'.
+Project-tool commands live under the major-mode-reserved
+`C-c C-<letter>' space."
+  "C-c C-d" #'wit-ts-deps-sync
+  "C-c C-u" #'wit-ts-deps-update
+  "C-c C-b" #'wit-ts-generate)
+
 ;;;###autoload
 (define-derived-mode wit-ts-mode prog-mode "WIT"
-  "Major mode for editing WIT files, powered by tree-sitter."
+  "Major mode for editing WIT (WebAssembly Interface Type) files.
+
+WIT describes the interfaces of WebAssembly components.  This mode
+is powered by the tree-sitter `wit' grammar, which is installed on
+first use (see `wit-ts-mode-grammar-url').
+
+Features:
+
+- Syntax highlighting, indentation, and `electric-indent-mode'.
+- Structural navigation: `forward-sexp', `beginning-of-defun', and
+  `which-function-mode' operate on WIT declarations, and Imenu
+  \(\\[imenu]) indexes worlds, interfaces, types, and functions.
+- Folding: brace blocks fold with `hs-minor-mode', and the
+  declaration hierarchy folds with `outline-minor-mode'.
+- Diagnostics: turn on `flymake-mode' to see parse errors, with
+  tailored messages for common `use'/`import'/`export' mistakes.
+- Completion at point (\\[completion-at-point]) is context-aware:
+  in an `import'/`export'/`use' path it offers local interfaces
+  and foreign package paths; in a `use PATH.{...}' names list it
+  offers the target interface's types and resources; elsewhere it
+  offers keywords, builtin types, and buffer definitions.
+
+Dependencies:
+
+Cross-file and cross-package completion resolves symbols from the
+sources fetched under the project's dependency directory (see
+`wit-ts-deps-directory').  Manage them with:
+
+\\[wit-ts-deps-sync]
+    Resolve dependencies from the manifest, honouring the lock
+    file.
+\\[wit-ts-deps-update]
+    Pull newer sources for dynamic references and rewrite the lock
+    file.
+
+Both run asynchronously and populate the same dependency
+directory.  The tool is chosen by `wit-ts-deps-tool-function':
+by default `wit-deps' for a project with a `deps.toml' manifest
+and `wkg' (wasm-pkg-tools) otherwise.
+
+Files under that dependency directory are fetched artifacts, so
+they are visited read-only (see `wit-ts-mode-deps-read-only').
+
+Generation:
+
+\\[wit-ts-generate]
+    Generate bindings or build a component, using the tool that
+    matches the project (see `wit-ts-deps-tool-function'):
+    `wit-bindgen' for a `wit-deps' project or `cargo-component
+    build' for a `wkg' one.  Prompts for the arguments (pre-filled
+    with a tool-appropriate template), then remembers them per
+    project for the session; a prefix argument re-prompts.  The
+    exact command is shown in the tool's output buffer and the echo
+    area.
+
+\\{wit-ts-mode-map}"
   :group 'wit-ts
   (wit-ts-mode--ensure-grammar)
 
@@ -592,9 +2073,11 @@ protocol.  Intended for `flymake-diagnostic-functions'."
                  nil nil)
                 ("Function" "\\`func_item\\'" nil nil)))
 
-  ;; Folding: hideshow reads the `hs-special-modes-alist' entry above; a
-  ;; tree-sitter-driven outline covers the declaration hierarchy, via a
-  ;; custom search function (see `wit-ts-mode--outline-search').
+  ;; Folding: `hs-minor-mode' folds brace blocks, configured buffer-locally
+  ;; via `wit-ts-mode--setup-hideshow' (see above); a tree-sitter-driven
+  ;; outline covers the declaration hierarchy, via a custom search function
+  ;; (see `wit-ts-mode--outline-search').
+  (add-hook 'hs-minor-mode-hook #'wit-ts-mode--setup-hideshow nil t)
   (setq-local outline-search-function #'wit-ts-mode--outline-search)
   (setq-local outline-level #'wit-ts-mode--outline-level)
 
@@ -605,6 +2088,16 @@ protocol.  Intended for `flymake-diagnostic-functions'."
   ;; Completion: keywords, builtin types, and buffer-local definitions.
   (add-hook 'completion-at-point-functions
             #'wit-ts-mode-completion-at-point nil t)
+
+  ;; Cross-reference: jump to definitions with `xref-find-definitions'
+  ;; (\\[xref-find-definitions]), across the buffer and project files.
+  (add-hook 'xref-backend-functions #'wit-ts-mode--xref-backend nil t)
+
+  ;; Dependency files (under DIR/deps/) are fetched artifacts, so visit
+  ;; them read-only -- e.g. when jumping to a definition there.
+  (when (and wit-ts-mode-deps-read-only
+             (wit-ts-mode--in-deps-directory-p))
+    (setq buffer-read-only t))
 
   (treesit-major-mode-setup))
 

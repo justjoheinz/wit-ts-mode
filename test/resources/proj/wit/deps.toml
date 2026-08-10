@@ -1,0 +1,4 @@
+# Minimal wit-deps manifest for tests.  The dependency source is not
+# fetched here; deps/dep/dep.wit is committed so the index layer can be
+# exercised offline.
+dep = "https://example.invalid/dep.tar.gz"

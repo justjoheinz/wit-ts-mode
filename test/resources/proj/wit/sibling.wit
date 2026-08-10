@@ -1,0 +1,9 @@
+// Sibling file sharing the root package (example:root) to exercise
+// multi-file package scoping: `sibling-iface' must be offered as a
+// bare local name when completing an import/use path in root.wit.
+package example:root@0.1.0;
+
+interface sibling-iface {
+    type timestamp = u64;
+    ping: func();
+}

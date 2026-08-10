@@ -1,0 +1,7 @@
+package example:root@0.1.0;
+
+interface app {
+    use dep-iface.{widget};
+
+    run: func() -> widget;
+}
