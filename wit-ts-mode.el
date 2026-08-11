@@ -1257,30 +1257,31 @@ maps it through `wit-ts-mode--kind-company-kinds'."
   (cdr (assq (wit-ts-mode--candidate-kind candidate)
              wit-ts-mode--kind-company-kinds)))
 
-(defconst wit-ts-mode--definition-kinds
-  '(interface world record variant enum flags resource type func)
-  "WIT candidate kinds that name a definition with a signature.
-Keywords, builtin types and feature-gate names are excluded: they
-have no definition to describe.")
-
 (defun wit-ts-mode--candidate-signature (candidate)
   "Return the one-line WIT signature for completion CANDIDATE, or nil.
-Only definition candidates (see `wit-ts-mode--definition-kinds')
-have a signature.  The candidate is resolved the way Eldoc
-resolves a symbol (reusing `wit-ts-mode--node-signature'): a
-foreign `pkg/name@version' path in the named package, a bare name
-in the current buffer then elsewhere in the project.  Return nil
-when the candidate is not a definition or cannot be resolved."
-  (when (memq (wit-ts-mode--candidate-kind candidate)
-              wit-ts-mode--definition-kinds)
-    (let* ((split (wit-ts-mode--split-use-path
-                   (substring-no-properties candidate)))
-           (package (car split))
-           (name (cdr split))
-           (result (or (and (null package)
-                            (wit-ts-mode--local-signature name))
-                       (wit-ts-mode--project-signature name package))))
-      (car result))))
+CANDIDATE is resolved the way Eldoc resolves a symbol (reusing
+`wit-ts-mode--node-signature'): a foreign `pkg/name@version' path
+in the named package, a bare name in the current buffer then
+elsewhere in the project.  Keywords, builtin types and
+feature-gate names are skipped -- they name no definition -- so
+that scrolling past them does not trigger a project-wide scan.
+Return nil when CANDIDATE names no resolvable definition.
+
+The candidate's WIT kind text property is deliberately not
+consulted: completion frontends (e.g. Corfu) strip text properties
+before calling the doc functions, so resolution must work from the
+plain string alone."
+  (let ((text (substring-no-properties candidate)))
+    (unless (or (member text wit-ts-mode--keywords)
+                (member text wit-ts-mode--builtin-types)
+                (member text wit-ts-mode--gates))
+      (let* ((split (wit-ts-mode--split-use-path text))
+             (package (car split))
+             (name (cdr split))
+             (result (or (and (null package)
+                              (wit-ts-mode--local-signature name))
+                         (wit-ts-mode--project-signature name package))))
+        (car result)))))
 
 (defun wit-ts-mode--candidate-docsig (candidate)
   "Return CANDIDATE's signature for Company's echo-area `docsig'.

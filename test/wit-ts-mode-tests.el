@@ -643,21 +643,34 @@ advertises `identity' as its display sort so frontends preserve it."
                      "add: func(a: u32) -> u32")))))
 
 (ert-deftest wit-ts-mode-candidate-signature-nil-for-non-definition ()
-  "Keywords and builtins have no signature (doc functions return nil)."
+  "Keywords, builtins and gates have no signature (doc functions return nil).
+Plain strings are used deliberately: completion frontends strip the
+kind text property before calling the doc functions."
   (skip-unless (treesit-ready-p 'wit t))
-  (should-not (wit-ts-mode--candidate-signature
-               (wit-ts-mode--kinded "interface" 'keyword)))
-  (should-not (wit-ts-mode--candidate-signature
-               (wit-ts-mode--kinded "u32" 'builtin)))
-  (should-not (wit-ts-mode--candidate-doc-buffer
-               (wit-ts-mode--kinded "since" 'gate))))
+  (should-not (wit-ts-mode--candidate-signature "interface"))
+  (should-not (wit-ts-mode--candidate-signature "u32"))
+  (should-not (wit-ts-mode--candidate-doc-buffer "since")))
+
+(ert-deftest wit-ts-mode-candidate-signature-works-without-kind-property ()
+  "The signature resolves from a plain string, without the kind property.
+Regression: Corfu passes the bare candidate string (no text
+properties) to the doc functions, so resolution must not rely on
+the WIT kind property."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface calc {\n  add: func(a: u32) -> u32;\n}\n")
+    (wit-ts-mode)
+    ;; A bare, unpropertized string -- exactly what Corfu passes.
+    (should (equal (wit-ts-mode--candidate-signature "add")
+                   "add: func(a: u32) -> u32"))))
 
 (ert-deftest wit-ts-mode-candidate-signature-resolves-foreign ()
-  "A foreign path candidate's signature resolves across deps/."
+  "A foreign path candidate's signature resolves across deps/.
+The candidate is a plain string, as passed by completion frontends."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
-    (let ((cand (wit-ts-mode--kinded "example:dep/dep-iface@0.1.0" 'interface)))
-      (should (equal (wit-ts-mode--candidate-signature cand)
-                     "interface dep-iface { widget, gadget }")))))
+    (should (equal (wit-ts-mode--candidate-signature
+                    "example:dep/dep-iface@0.1.0")
+                   "interface dep-iface { widget, gadget }"))))
 
 ;;; Feature gates (@since / @unstable / @deprecated)
 
