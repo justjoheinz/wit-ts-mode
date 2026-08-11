@@ -6,7 +6,7 @@
 ;; Assisted-by: claude:claude-opus-4-8
 ;; URL: https://github.com/justjoheinz/wit-ts-mode
 ;; Keywords: languages wasm wit
-;; Version: 0.1.0
+;; Version: 0.1.1
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: Apache-2.0
 
