@@ -1523,16 +1523,16 @@ as a head plus member summary.  Return nil when NODE is nil."
 (defun wit-ts-mode--node-signature-summary (node kind)
   "Return a head-plus-member-summary signature for NODE of KIND.
 The head is NODE's declaration up to its body (e.g. \"record
-point\"); the summary lists member names, e.g. \"{ x, y }\", or
-\"{ 3 members }\" when there are more than a handful."
+point\" or \"interface streams\"); the summary lists every member
+name, e.g. \"{ x, y }\".  All names are included -- the result is a
+single logical line, and Eldoc frontends (the multiline echo area
+or `eldoc-box') wrap it as needed.  When NODE has no members the
+bare head is returned."
   (let* ((head (wit-ts-mode--node-header-text node))
          (members (wit-ts-mode--node-member-names node kind)))
-    (cond
-     ((null members) head)
-     ((<= (length members) 5)
-      (format "%s { %s }" head (string-join members ", ")))
-     (t
-      (format "%s { %d members }" head (length members))))))
+    (if members
+        (format "%s { %s }" head (string-join members ", "))
+      head)))
 
 (defun wit-ts-mode--definition-in-root (root name)
   "Return (NODE . KIND) for the definition of NAME under ROOT.

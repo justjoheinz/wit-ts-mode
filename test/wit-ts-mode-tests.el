@@ -909,7 +909,8 @@ function defers."
         (should (equal (wit-ts-mode--node-signature member kind) (cdr case)))))))
 
 (ert-deftest wit-ts-mode-node-signature-summarises-large-body ()
-  "A body longer than the inline limit is rendered as a member summary."
+  "A body longer than the inline limit is rendered as a member summary.
+The summary lists every field name (no count, no truncation)."
   (skip-unless (treesit-ready-p 'wit t))
   (with-temp-buffer
     (insert "interface i { record big { aaaaaaaa: u32, bbbbbbbb: u32,"
@@ -918,6 +919,23 @@ function defers."
     (let ((rec (treesit-search-subtree (treesit-buffer-root-node) "record_item")))
       (should (equal (wit-ts-mode--node-signature rec 'record)
                      "record big { aaaaaaaa, bbbbbbbb, cccccccc, dddddddd }")))))
+
+(ert-deftest wit-ts-mode-node-signature-lists-all-members ()
+  "The member summary lists all names even for many members (no count).
+Regression against the earlier \"{ N members }\" collapse."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "interface big-iface {"
+            " a: func(); b: func(); c: func(); d: func();"
+            " e: func(); f: func(); g: func(); }")
+    (wit-ts-mode)
+    (let* ((iface (treesit-search-subtree (treesit-buffer-root-node)
+                                          "interface_item"))
+           (sig (wit-ts-mode--node-signature iface 'interface)))
+      (should (equal sig "interface big-iface { a, b, c, d, e, f, g }"))
+      ;; No count marker, and the last member survives (nothing truncated).
+      (should-not (string-match-p "members" sig))
+      (should (string-match-p "\\bg\\b" sig)))))
 
 (ert-deftest wit-ts-mode-eldoc-on-definition ()
   "Eldoc shows the signature when point is on a definition name."
