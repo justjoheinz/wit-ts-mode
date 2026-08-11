@@ -235,6 +235,12 @@ soon as they parse. Any completion UI that reads
 `completion-at-point` — picks these up automatically; in Doom the configured
 front-end (Corfu or Company) just works.
 
+Each candidate carries its WIT kind (shown as an icon in Corfu/Company and as
+a trailing annotation in `*Completions*`), and — for definition candidates —
+its full signature, the same one Eldoc shows. Corfu's `corfu-popupinfo-mode`
+and Company's doc popup (`company-quickhelp`) display that signature for the
+highlighted candidate, and Company also shows it in the echo area.
+
 ### Cross-file symbols and dependencies
 
 There is no WIT language server, so `wit-ts-mode` resolves cross-file symbols

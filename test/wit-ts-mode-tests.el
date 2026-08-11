@@ -625,6 +625,40 @@ advertises `identity' as its display sort so frontends preserve it."
       (should cand)
       (should (eq (wit-ts-mode--candidate-kind cand) 'interface)))))
 
+(ert-deftest wit-ts-mode-capf-exposes-doc-functions ()
+  "The capf provides Company/Corfu docsig and doc-buffer functions."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface calc {\n  add: func(a: u32) -> u32;\n  ")
+    (wit-ts-mode)
+    (let* ((capf (wit-ts-mode-completion-at-point))
+           (props (nthcdr 3 capf))
+           (docsig (plist-get props :company-docsig))
+           (docbuf (plist-get props :company-doc-buffer))
+           (cand (wit-ts-mode-tests--find-candidate "add" (nth 2 capf))))
+      (should (functionp docsig))
+      (should (functionp docbuf))
+      (should (equal (funcall docsig cand) "add: func(a: u32) -> u32"))
+      (should (equal (with-current-buffer (funcall docbuf cand) (buffer-string))
+                     "add: func(a: u32) -> u32")))))
+
+(ert-deftest wit-ts-mode-candidate-signature-nil-for-non-definition ()
+  "Keywords and builtins have no signature (doc functions return nil)."
+  (skip-unless (treesit-ready-p 'wit t))
+  (should-not (wit-ts-mode--candidate-signature
+               (wit-ts-mode--kinded "interface" 'keyword)))
+  (should-not (wit-ts-mode--candidate-signature
+               (wit-ts-mode--kinded "u32" 'builtin)))
+  (should-not (wit-ts-mode--candidate-doc-buffer
+               (wit-ts-mode--kinded "since" 'gate))))
+
+(ert-deftest wit-ts-mode-candidate-signature-resolves-foreign ()
+  "A foreign path candidate's signature resolves across deps/."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (let ((cand (wit-ts-mode--kinded "example:dep/dep-iface@0.1.0" 'interface)))
+      (should (equal (wit-ts-mode--candidate-signature cand)
+                     "interface dep-iface { widget, gadget }")))))
+
 ;;; Feature gates (@since / @unstable / @deprecated)
 
 (defun wit-ts-mode-tests--capf-candidates (content)

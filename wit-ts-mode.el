@@ -1236,7 +1236,12 @@ buffer.  Suitable for `completion-at-point-functions'."
               ;; Surface each candidate's WIT kind: as trailing text in the
               ;; `*Completions*' buffer, and as an icon in Corfu/Company.
               :annotation-function #'wit-ts-mode--completion-annotation
-              :company-kind #'wit-ts-mode--candidate-company-kind)))))
+              :company-kind #'wit-ts-mode--candidate-company-kind
+              ;; Full signature for the highlighted candidate: Company shows
+              ;; it in the echo area (`docsig'), and Corfu/Company render it
+              ;; in a doc popup (`doc-buffer'), mirroring Eldoc.
+              :company-docsig #'wit-ts-mode--candidate-docsig
+              :company-doc-buffer #'wit-ts-mode--candidate-doc-buffer)))))
 
 (defun wit-ts-mode--completion-annotation (candidate)
   "Return the annotation string for completion CANDIDATE, or nil.
@@ -1251,6 +1256,48 @@ Reads the candidate's WIT kind (see `wit-ts-mode--kinded') and
 maps it through `wit-ts-mode--kind-company-kinds'."
   (cdr (assq (wit-ts-mode--candidate-kind candidate)
              wit-ts-mode--kind-company-kinds)))
+
+(defconst wit-ts-mode--definition-kinds
+  '(interface world record variant enum flags resource type func)
+  "WIT candidate kinds that name a definition with a signature.
+Keywords, builtin types and feature-gate names are excluded: they
+have no definition to describe.")
+
+(defun wit-ts-mode--candidate-signature (candidate)
+  "Return the one-line WIT signature for completion CANDIDATE, or nil.
+Only definition candidates (see `wit-ts-mode--definition-kinds')
+have a signature.  The candidate is resolved the way Eldoc
+resolves a symbol (reusing `wit-ts-mode--node-signature'): a
+foreign `pkg/name@version' path in the named package, a bare name
+in the current buffer then elsewhere in the project.  Return nil
+when the candidate is not a definition or cannot be resolved."
+  (when (memq (wit-ts-mode--candidate-kind candidate)
+              wit-ts-mode--definition-kinds)
+    (let* ((split (wit-ts-mode--split-use-path
+                   (substring-no-properties candidate)))
+           (package (car split))
+           (name (cdr split))
+           (result (or (and (null package)
+                            (wit-ts-mode--local-signature name))
+                       (wit-ts-mode--project-signature name package))))
+      (car result))))
+
+(defun wit-ts-mode--candidate-docsig (candidate)
+  "Return CANDIDATE's signature for Company's echo-area `docsig'.
+See `wit-ts-mode--candidate-signature'."
+  (wit-ts-mode--candidate-signature candidate))
+
+(defun wit-ts-mode--candidate-doc-buffer (candidate)
+  "Return a buffer describing CANDIDATE, for doc popups, or nil.
+Read by `corfu-popupinfo-mode' and `company' (its `doc-buffer'
+command, used by `company-quickhelp').  Contains the candidate's
+one-line signature (see `wit-ts-mode--candidate-signature')."
+  (when-let* ((sig (wit-ts-mode--candidate-signature candidate)))
+    (with-current-buffer (get-buffer-create " *wit-ts-mode-doc*")
+      (erase-buffer)
+      (insert sig)
+      (goto-char (point-min))
+      (current-buffer))))
 
 (defun wit-ts-mode--in-use-names-list-p ()
   "Return non-nil when point is in a `use PATH.{ ... }' names list."
