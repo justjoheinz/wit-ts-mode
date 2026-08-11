@@ -27,6 +27,11 @@ translation of that project's `queries/highlights.scm`; folding mirrors
   groups.
 - **Which-function** — `which-function-mode` shows the enclosing declaration
   (e.g. `foo.errno`, `random.get-random-bytes`) in the mode line.
+- **Eldoc** — the signature of the definition (or reference) at point shows in
+  the echo area: a function's parameters and result, a type alias's target, a
+  record/variant/enum/flags/resource/interface summary. Resolves symbols in
+  the current buffer and — for `wit-deps`-managed projects — in sibling files
+  and resolved dependencies.
 - **Folding** — `hideshow` support for the brace blocks (interfaces, worlds,
   records, resources, variants, …) and block comments.
 - **Outline** — a tree-sitter–driven `outline-minor-mode` heading hierarchy

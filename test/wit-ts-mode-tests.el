@@ -952,6 +952,45 @@ function defers."
                "interface i {\n  f: func() -> unknown-type;\n}\n"
                "unknown-typ")))
 
+(defun wit-ts-mode-tests--eldoc-here ()
+  "Return the Eldoc string at point in the current buffer, or nil."
+  (let (captured)
+    (wit-ts-mode--eldoc-function (lambda (doc &rest _) (setq captured doc)))
+    (and captured (substring-no-properties captured))))
+
+(ert-deftest wit-ts-mode-eldoc-resolves-sibling-bare-name ()
+  "A bare name defined in a sibling file (same package) resolves."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    ;; `sibling-iface' lives in sibling.wit under the same package.
+    (insert "\nworld w {\n  export sibling-iface;\n}\n")
+    (goto-char (point-max))
+    (search-backward "sibling-iface")
+    (goto-char (1+ (point)))
+    (should (equal (wit-ts-mode-tests--eldoc-here)
+                   "interface sibling-iface { timestamp, ping }"))))
+
+(ert-deftest wit-ts-mode-eldoc-resolves-foreign-interface ()
+  "A qualified use path resolves to a foreign interface under deps/."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  import example:dep/dep-iface@0.1.0;\n}\n")
+    (goto-char (point-max))
+    (search-backward "dep-iface")
+    (goto-char (1+ (point)))
+    (should (equal (wit-ts-mode-tests--eldoc-here)
+                   "interface dep-iface { widget, gadget }"))))
+
+(ert-deftest wit-ts-mode-eldoc-resolves-foreign-world-in-include ()
+  "An include path resolves to a foreign world under deps/."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  include example:dep/dep-world@0.1.0;\n}\n")
+    (goto-char (point-max))
+    (search-backward "dep-world")
+    (goto-char (1+ (point)))
+    (should (equal (wit-ts-mode-tests--eldoc-here) "world dep-world"))))
+
 ;;; Read-only dependency files
 
 (ert-deftest wit-ts-mode-deps-file-is-read-only ()

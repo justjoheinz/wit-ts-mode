@@ -1534,49 +1534,106 @@ point\"); the summary lists member names, e.g. \"{ x, y }\", or
      (t
       (format "%s { %d members }" head (length members))))))
 
-(defun wit-ts-mode--local-definition (name)
-  "Return (NODE . KIND) for the definition of NAME in the current buffer.
+(defun wit-ts-mode--definition-in-root (root name)
+  "Return (NODE . KIND) for the definition of NAME under ROOT.
 NODE is the whole definition node (e.g. a `func_item') and KIND its
-WIT kind symbol.  Return nil when no such definition exists.  The
+WIT kind symbol.  Return nil when ROOT has no such definition.  The
 first match in document order wins."
-  (when-let* ((parser (wit-ts-mode--parser)))
-    (catch 'found
-      (dolist (def (wit-ts-mode--definitions-in-node
-                    (treesit-parser-root-node parser)
-                    wit-ts-mode--completion-defs-query))
-        (when (equal (plist-get def :name) name)
-          ;; :node is the name id; climb to the enclosing definition node.
-          (when-let* ((item (treesit-parent-until
-                             (plist-get def :node)
-                             (lambda (n)
-                               (string-match-p wit-ts-mode--defun-node-regexp
-                                               (treesit-node-type n)))
-                             t)))
-            (throw 'found (cons item (plist-get def :kind)))))))))
+  (catch 'found
+    (dolist (def (wit-ts-mode--definitions-in-node
+                  root wit-ts-mode--completion-defs-query))
+      (when (equal (plist-get def :name) name)
+        ;; :node is the name id; climb to the enclosing definition node.
+        (when-let* ((item (treesit-parent-until
+                           (plist-get def :node)
+                           (lambda (n)
+                             (string-match-p wit-ts-mode--defun-node-regexp
+                                             (treesit-node-type n)))
+                           t)))
+          (throw 'found (cons item (plist-get def :kind))))))))
 
-(defun wit-ts-mode--eldoc-name-at-point ()
-  "Return the bare definition name Eldoc should document at point, or nil.
-For a `use'/`import' path or its names list the trailing interface
-or member name is used; otherwise the symbol at point.  Any
-package qualifier and @version are dropped."
+(defun wit-ts-mode--local-signature (name)
+  "Return a (SIGNATURE . KIND) cons for NAME defined in the current buffer.
+Return nil when no such definition exists."
+  (when-let* ((parser (wit-ts-mode--parser))
+              (def (wit-ts-mode--definition-in-root
+                    (treesit-parser-root-node parser) name)))
+    (cons (wit-ts-mode--node-signature (car def) (cdr def)) (cdr def))))
+
+(defun wit-ts-mode--project-signature (name package)
+  "Return a (SIGNATURE . KIND) cons for NAME defined elsewhere in the project.
+Scans the `.wit' files under the WIT root (see
+`wit-ts-mode--wit-root'), excluding the current buffer's own file.
+When PACKAGE is non-nil, only files declaring that package match;
+otherwise files sharing the current buffer's package (siblings)
+match, so a bare NAME resolves within its own package.  Each
+candidate file is parsed in a temporary buffer and its matching
+definition rendered there (the signature is a string, so it
+outlives that buffer).  Return nil when NAME is not found."
+  (when-let* ((roots (wit-ts-mode--wit-root))
+              (wit-root (car roots)))
+    (let ((own-pkg (wit-ts-mode--buffer-package-id))
+          (self (and buffer-file-name (expand-file-name buffer-file-name))))
+      (catch 'found
+        (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
+          (unless (equal (expand-file-name file) self)
+            (when (treesit-ready-p 'wit t)
+              (ignore-errors
+                (with-temp-buffer
+                  (insert-file-contents file)
+                  (let* ((parser (treesit-parser-create 'wit))
+                         (root (treesit-parser-root-node parser))
+                         (pkg (wit-ts-mode--package-id-from-decl-head
+                               (car (treesit-query-capture
+                                     root wit-ts-mode--completion-packages-query
+                                     nil nil t))))
+                         (match (if package
+                                    (equal pkg package)
+                                  (and own-pkg (equal pkg own-pkg)))))
+                    (when match
+                      (when-let* ((def (wit-ts-mode--definition-in-root
+                                        root name)))
+                        (throw 'found
+                               (cons (wit-ts-mode--node-signature
+                                      (car def) (cdr def))
+                                     (cdr def)))))))))))))))
+
+(defun wit-ts-mode--eldoc-target-at-point ()
+  "Return (NAME . PACKAGE) Eldoc should document at point, or nil.
+For a qualified `use'/`import' path (e.g. `wasi:io/streams@0.2.0')
+PACKAGE is the package id and NAME the interface; for its names
+list NAME is the member and PACKAGE nil.  For a bare symbol NAME is
+the symbol and PACKAGE nil.  Any @version is dropped."
   (when-let* ((id (wit-ts-mode--identifier-at-point)))
     (if (get-text-property 0 wit-ts-mode--xref-path-property id)
-        (wit-ts-mode--xref-path-target id)
-      (substring-no-properties id))))
+        (let ((split (wit-ts-mode--split-use-path
+                      (string-remove-suffix "." id))))
+          (cons (cdr split) (car split)))
+      (cons (substring-no-properties id) nil))))
 
 (defun wit-ts-mode--eldoc-function (callback &rest _)
   "Eldoc backend for `wit-ts-mode': document the symbol at point.
-Resolves the name at point to a definition in the current buffer
-and, via CALLBACK, shows its one-line signature (see
-`wit-ts-mode--node-signature').  Suitable for
-`eldoc-documentation-functions'.  Return non-nil when it defers to
-CALLBACK, per the Eldoc protocol."
-  (when-let* ((name (wit-ts-mode--eldoc-name-at-point))
-              (def (wit-ts-mode--local-definition name))
-              (sig (wit-ts-mode--node-signature (car def) (cdr def))))
+Resolves the name at point to a definition -- first in the current
+buffer, then across the project's files and resolved dependencies
+\(see `wit-ts-mode--project-signature') -- and shows its one-line
+signature (see `wit-ts-mode--node-signature') via CALLBACK.
+Suitable for `eldoc-documentation-functions'.  Return non-nil when
+it defers to CALLBACK, per the Eldoc protocol."
+  (when-let* ((target (wit-ts-mode--eldoc-target-at-point))
+              (name (car target))
+              ;; PACKAGE may legitimately be nil (a bare name), so resolve it
+              ;; outside the `when-let*' guard: a bare name resolves in the
+              ;; current buffer first, then the project; a qualified path
+              ;; names a specific (usually foreign) package and skips the
+              ;; local buffer.
+              (result (let ((package (cdr target)))
+                        (or (and (null package)
+                                 (wit-ts-mode--local-signature name))
+                            (wit-ts-mode--project-signature name package))))
+              (sig (car result)))
     (funcall callback sig
              :thing name
-             :face (wit-ts-mode--eldoc-face (cdr def)))
+             :face (wit-ts-mode--eldoc-face (cdr result)))
     t))
 
 (defun wit-ts-mode--eldoc-face (kind)
