@@ -865,6 +865,93 @@ field, variant case, enum case, flags field, or resource method
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
     (should-not (wit-ts-mode--xref-find-definitions "no-such-name"))))
 
+;;; Eldoc
+
+(defun wit-ts-mode-tests--eldoc-at (content marker)
+  "Return the Eldoc string for CONTENT with point just after MARKER.
+MARKER is searched from the buffer start; point is left at its end
+\(inside the target identifier).  Returns nil when the Eldoc
+function defers."
+  (with-temp-buffer
+    (insert content)
+    (wit-ts-mode)
+    (goto-char (point-min))
+    (search-forward marker)
+    (let (captured)
+      (wit-ts-mode--eldoc-function (lambda (doc &rest _) (setq captured doc)))
+      (and captured (substring-no-properties captured)))))
+
+(ert-deftest wit-ts-mode-node-signature-formats-each-kind ()
+  "`wit-ts-mode--node-signature' renders each definition kind."
+  (skip-unless (treesit-ready-p 'wit t))
+  (dolist (case '(("interface i { f: func(a: u32) -> string; }" . "f: func(a: u32) -> string")
+                  ("interface i { type n = u64; }" . "type n = u64")
+                  ("interface i { record p { x: u32, y: u32 } }" . "record p { x: u32, y: u32 }")
+                  ("interface i { variant v { a, b(u32) } }" . "variant v { a, b(u32) }")
+                  ("interface i { enum e { on, off } }" . "enum e { on, off }")
+                  ("interface i { flags g { r, w } }" . "flags g { r, w }")))
+    (with-temp-buffer
+      (insert (car case))
+      (wit-ts-mode)
+      (let* ((root (treesit-buffer-root-node))
+             ;; The first member definition inside the interface body.
+             (def (treesit-search-subtree
+                   root wit-ts-mode--defun-node-regexp))
+             ;; Skip the interface_item itself; take its first body child def.
+             (member (treesit-search-subtree
+                      (car (treesit-filter-child
+                            def (lambda (c) (equal (treesit-node-type c) "body"))))
+                      wit-ts-mode--defun-node-regexp))
+             (kind (pcase (treesit-node-type member)
+                     ("func_item" 'func) ("type_item" 'type)
+                     ("record_item" 'record) ("variant_items" 'variant)
+                     ("enum_items" 'enum) ("flags_items" 'flags))))
+        (should (equal (wit-ts-mode--node-signature member kind) (cdr case)))))))
+
+(ert-deftest wit-ts-mode-node-signature-summarises-large-body ()
+  "A body longer than the inline limit is rendered as a member summary."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "interface i { record big { aaaaaaaa: u32, bbbbbbbb: u32,"
+            " cccccccc: u32, dddddddd: u32 } }")
+    (wit-ts-mode)
+    (let ((rec (treesit-search-subtree (treesit-buffer-root-node) "record_item")))
+      (should (equal (wit-ts-mode--node-signature rec 'record)
+                     "record big { aaaaaaaa, bbbbbbbb, cccccccc, dddddddd }")))))
+
+(ert-deftest wit-ts-mode-eldoc-on-definition ()
+  "Eldoc shows the signature when point is on a definition name."
+  (skip-unless (treesit-ready-p 'wit t))
+  (let ((src (concat "package a:b;\ninterface calc {\n  type num = f64;\n"
+                     "  record point { x: num, y: num }\n"
+                     "  add: func(a: num, b: num) -> num;\n}\n")))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "ad")
+                   "add: func(a: num, b: num) -> num"))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "type nu")
+                   "type num = f64"))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "record poi")
+                   "record point { x: num, y: num }"))))
+
+(ert-deftest wit-ts-mode-eldoc-on-reference ()
+  "Eldoc resolves a type reference in a signature to its definition."
+  (skip-unless (treesit-ready-p 'wit t))
+  (let ((src (concat "package a:b;\ninterface calc {\n  type num = f64;\n"
+                     "  record point { x: num, y: num }\n"
+                     "  distance: func(p: point) -> num;\n}\n")))
+    ;; Reference to the `point' record in a parameter type.
+    (should (equal (wit-ts-mode-tests--eldoc-at src "distance: func(p: poi")
+                   "record point { x: num, y: num }"))
+    ;; Reference to the `num' type alias in the return type.
+    (should (equal (wit-ts-mode-tests--eldoc-at src "-> nu")
+                   "type num = f64"))))
+
+(ert-deftest wit-ts-mode-eldoc-defers-when-undefined ()
+  "Eldoc returns nil (defers) for a symbol with no local definition."
+  (skip-unless (treesit-ready-p 'wit t))
+  (should-not (wit-ts-mode-tests--eldoc-at
+               "interface i {\n  f: func() -> unknown-type;\n}\n"
+               "unknown-typ")))
+
 ;;; Read-only dependency files
 
 (ert-deftest wit-ts-mode-deps-file-is-read-only ()
