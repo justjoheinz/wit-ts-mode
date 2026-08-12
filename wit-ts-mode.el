@@ -2237,6 +2237,22 @@ Project-tool commands live under the major-mode-reserved
   "C-c C-u" #'wit-ts-deps-update
   "C-c C-b" #'wit-ts-generate)
 
+(defvar wit-ts-mode--syntax-table
+  (let ((table (make-syntax-table prog-mode-syntax-table)))
+    ;; WIT identifiers are kebab-case (e.g. `wall-clock'), so `-' is a
+    ;; symbol constituent; `%' introduces a raw identifier (e.g. `%func').
+    (modify-syntax-entry ?- "_" table)
+    (modify-syntax-entry ?% "_" table)
+    ;; `<' and `>' only ever delimit generic type arguments (`list<T>',
+    ;; `tuple<u64, complex>'); as punctuation they stop `thing-at-point'
+    ;; from swallowing them, so a type embedded in a higher-kinded type
+    ;; resolves for Eldoc and xref.  `prog-mode' inherits them as symbol
+    ;; constituents, which is why the override is needed.
+    (modify-syntax-entry ?< "." table)
+    (modify-syntax-entry ?> "." table)
+    table)
+  "Syntax table for `wit-ts-mode'.")
+
 ;;;###autoload
 (define-derived-mode wit-ts-mode prog-mode "WIT"
   "Major mode for editing WIT (WebAssembly Interface Type) files.
@@ -2296,6 +2312,7 @@ Generation:
 
 \\{wit-ts-mode-map}"
   :group 'wit-ts
+  :syntax-table wit-ts-mode--syntax-table
   (wit-ts-mode--ensure-grammar)
 
   (setq wit-ts-mode--flymake-parser (treesit-parser-create 'wit))

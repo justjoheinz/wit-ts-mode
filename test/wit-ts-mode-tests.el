@@ -875,6 +875,25 @@ field, variant case, enum case, flags field, or resource method
     (should (equal (wit-ts-mode-tests--xref-summaries "widget")
                    '("record widget")))))
 
+(ert-deftest wit-ts-mode-xref-identifier-in-higher-kinded-type ()
+  "A type embedded in a higher-kinded type resolves to a bare name.
+Regression: `<'/`>' were symbol constituents, so the identifier at
+point in `tuple<u64, complex>' or `option<complex>' came back with
+the brackets attached and matched no definition."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface i {\n  record complex { re: f64, im: f64 }\n"
+            "  type pair = tuple<u64, complex>;\n"
+            "  type maybe = option<complex>;\n}\n")
+    (wit-ts-mode)
+    (dolist (marker '("tuple<u64, comp" "option<comp"))
+      (goto-char (point-min))
+      (search-forward marker)
+      (let ((id (wit-ts-mode--identifier-at-point)))
+        (should (equal id "complex"))
+        (should (equal (wit-ts-mode-tests--xref-summaries id)
+                       '("record complex")))))))
+
 (ert-deftest wit-ts-mode-xref-use-path-to-foreign-interface ()
   "A foreign use_path resolves to the interface in the dep file."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
@@ -1009,6 +1028,25 @@ Regression against the earlier \"{ N members }\" collapse."
     ;; Reference to the `num' type alias in the return type.
     (should (equal (wit-ts-mode-tests--eldoc-at src "-> nu")
                    "type num = f64"))))
+
+(ert-deftest wit-ts-mode-eldoc-on-reference-in-higher-kinded-type ()
+  "Eldoc resolves a type embedded in a higher-kinded type.
+Regression: the mode inherited `<'/`>' as symbol constituents from
+`prog-mode', so `thing-at-point' swallowed them and a name like
+`complex' in `tuple<u64, complex>' or `option<complex>' failed to
+resolve.  A punctuation syntax for `<'/`>' fixes it."
+  (skip-unless (treesit-ready-p 'wit t))
+  (let ((src (concat "package a:b;\ninterface calc {\n"
+                     "  record complex { re: f64, im: f64 }\n"
+                     "  type pair = tuple<u64, complex>;\n"
+                     "  type maybe = option<complex>;\n"
+                     "  type nested = list<tuple<complex, u32>>;\n}\n")))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "tuple<u64, comp")
+                   "record complex { re: f64, im: f64 }"))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "option<comp")
+                   "record complex { re: f64, im: f64 }"))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "list<tuple<comp")
+                   "record complex { re: f64, im: f64 }"))))
 
 (ert-deftest wit-ts-mode-eldoc-defers-when-undefined ()
   "Eldoc returns nil (defers) for a symbol with no local definition."
