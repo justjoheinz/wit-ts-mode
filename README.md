@@ -49,8 +49,9 @@ translation of that project's `queries/highlights.scm`; folding mirrors
   (`(treesit-available-p)` returns `t`). Emacs 30.1 is required for the
   outline and structural-navigation features (`treesit-thing-settings` and
   `treesit-outline-predicate` are new in 30.1).
-- The `wit` tree-sitter grammar installed and loadable
-  (`(treesit-ready-p 'wit)` returns `t`).
+- The `wit` tree-sitter grammar, loadable via `(treesit-ready-p 'wit)`. The
+  mode offers to install it for you on first use (see below), so you need not
+  install it yourself; a C compiler must be on your `PATH` to build it.
 
 ## Installing the grammar
 
