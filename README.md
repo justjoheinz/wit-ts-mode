@@ -299,10 +299,12 @@ there.
 
 ## Testing
 
-The `examples/` directory holds the sample `.wit` files from the grammar
-repository. Open any of them to exercise highlighting, indentation, imenu,
-folding, and outline. All five parse with zero errors and round-trip through
-`indent-region` unchanged (at their native indent width).
+The `examples/wit/` directory holds the sample `.wit` files from the grammar
+repository. They live under a `wit/` directory so that opening one puts it in
+a recognised project root (see `wit-ts-mode--wit-root`), enabling the
+project-scoped features. Open any of them to exercise highlighting,
+indentation, imenu, folding, and outline. All five parse with zero errors and
+round-trip through `indent-region` unchanged (at their native indent width).
 
 An ERT suite lives in `test/`, with fixtures under `test/resources/`. It
 covers font-lock faces, indentation, imenu, navigation and which-function,
