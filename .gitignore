@@ -14,3 +14,6 @@
 
 # Local wit-deps playground (not part of the package)
 /wit/
+
+# Auto-generated wkg lock files
+wkg.lock
