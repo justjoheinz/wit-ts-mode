@@ -143,7 +143,7 @@ Motion commands operate on the parse tree, so they respect WIT structure:
 `which-function-mode` shows the enclosing declaration in the mode line,
 including nesting — e.g. `foo.errno` for the `errno` enum inside interface
 `foo`, or `random.get-random-bytes` for a function inside interface `random`.
-In Doom it is enabled by default.
+Turn it on with `M-x which-function-mode`, or from `wit-ts-mode-hook`.
 
 ### Folding keys (`hs-minor-mode`)
 
@@ -189,14 +189,20 @@ warnings (toggle with `wit-ts-mode-check-references`):
 
 Jump between them with `M-x flymake-goto-next-error` /
 `flymake-goto-prev-error`, or list them with `M-x
-flymake-show-buffer-diagnostics`. In Doom, Flymake is enabled automatically
-for `prog-mode` derivatives, so this works out of the box.
+flymake-show-buffer-diagnostics`.
 
 To turn it on for every WIT buffer:
 
 ```elisp
 (add-hook 'wit-ts-mode-hook #'flymake-mode)
 ```
+
+`wit-ts-mode` derives from `prog-mode`, so anything hooked onto
+`prog-mode-hook` applies — but note that Doom only puts `flymake-mode` there
+when the `:checkers syntax` module carries the `+flymake` flag. Its default
+checker is Flycheck, which does not display Flymake backends, so under a
+default Doom configuration these diagnostics stay hidden until you enable
+`flymake-mode` yourself (the two can coexist per buffer).
 
 For a one-off look at *where* a file diverges from the grammar without any
 extra setup, `M-x treesit-explore-mode` shows the live parse tree with
