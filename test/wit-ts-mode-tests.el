@@ -319,6 +319,31 @@ above it."
       (outline-hide-subtree)
       (should-not (get-char-property line-a 'invisible)))))
 
+(ert-deftest wit-ts-mode-outline-search-terminates-on-unterminated-last-line ()
+  "Outline traversal must not loop on a heading at a newline-less last line.
+Regression test: typing `{' after `interface x' (or `world x') when
+that declaration is the buffer's final line with no trailing
+newline used to make `wit-ts-mode--outline-search' report the same
+line as the \"next\" heading forever.  Under `outline-minor-mode'
+with buttons this runs on `after-change-functions', producing a
+hard, C-g-proof freeze.  `outline-map-region' must terminate."
+  (skip-unless (treesit-ready-p 'wit t))
+  (require 'outline)
+  (with-temp-buffer
+    (insert "package p:x@0.0.1;\n\ninterface types {")  ; note: no trailing \n
+    (wit-ts-mode)
+    (treesit-parser-create 'wit)
+    ;; A runaway loop here would hang the whole test run rather than fail;
+    ;; a `with-timeout' cannot interrupt the C-level search loop, so the
+    ;; assertion is simply that this call returns at all.
+    (let ((count 0))
+      (outline-map-region (lambda () (setq count (1+ count)))
+                          (point-min) (point-max))
+      (should (= count 1)))
+    ;; Backward search from end-of-buffer must terminate too.
+    (goto-char (point-max))
+    (should (or (wit-ts-mode--outline-search nil t t) t))))
+
 ;;; Completion
 
 (ert-deftest wit-ts-mode-completion-includes-keywords-and-defs ()

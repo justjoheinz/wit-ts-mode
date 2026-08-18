@@ -6,7 +6,7 @@
 ;; Assisted-by: claude:claude-opus-4-8
 ;; URL: https://github.com/justjoheinz/wit-ts-mode
 ;; Keywords: languages wasm wit
-;; Version: 0.1.1
+;; Version: 0.1.2
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: Apache-2.0
 
@@ -1791,6 +1791,15 @@ For BOUND, MOVE, BACKWARD, and LOOKING-AT see `outline-search-function'."
         (catch 'done
           (while (if backward (not (bobp)) (not (eobp)))
             (forward-line step)
+            ;; When the buffer ends in a line with no trailing newline,
+            ;; `forward-line 1' from that line lands at end-of-buffer but
+            ;; leaves point on the *same* line (not at beginning-of-line).
+            ;; Re-checking that line would report the heading we started from
+            ;; as the "next" one, so `outline-map-region'/`outline-next-heading'
+            ;; would loop forever (a hard, C-g-proof freeze).  Stop instead of
+            ;; re-examining the line.
+            (when (and (not backward) (not (bolp)))
+              (throw 'done nil))
             (when (and bound (if backward (< (point) bound) (> (point) bound)))
               (throw 'done nil))
             (when (wit-ts-mode--outline-heading-on-line-p)
