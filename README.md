@@ -27,6 +27,11 @@ translation of that project's `queries/highlights.scm`; folding mirrors
   groups.
 - **Which-function** — `which-function-mode` shows the enclosing declaration
   (e.g. `foo.errno`, `random.get-random-bytes`) in the mode line.
+- **Eldoc** — the signature of the definition (or reference) at point shows in
+  the echo area: a function's parameters and result, a type alias's target, a
+  record/variant/enum/flags/resource/interface summary. Resolves symbols in
+  the current buffer and — for `wit-deps`-managed projects — in sibling files
+  and resolved dependencies.
 - **Folding** — `hideshow` support for the brace blocks (interfaces, worlds,
   records, resources, variants, …) and block comments.
 - **Outline** — a tree-sitter–driven `outline-minor-mode` heading hierarchy
@@ -44,8 +49,9 @@ translation of that project's `queries/highlights.scm`; folding mirrors
   (`(treesit-available-p)` returns `t`). Emacs 30.1 is required for the
   outline and structural-navigation features (`treesit-thing-settings` and
   `treesit-outline-predicate` are new in 30.1).
-- The `wit` tree-sitter grammar installed and loadable
-  (`(treesit-ready-p 'wit)` returns `t`).
+- The `wit` tree-sitter grammar, loadable via `(treesit-ready-p 'wit)`. The
+  mode offers to install it for you on first use (see below), so you need not
+  install it yourself; a C compiler must be on your `PATH` to build it.
 
 ## Installing the grammar
 
@@ -143,7 +149,7 @@ Motion commands operate on the parse tree, so they respect WIT structure:
 `which-function-mode` shows the enclosing declaration in the mode line,
 including nesting — e.g. `foo.errno` for the `errno` enum inside interface
 `foo`, or `random.get-random-bytes` for a function inside interface `random`.
-In Doom it is enabled by default.
+Turn it on with `M-x which-function-mode`, or from `wit-ts-mode-hook`.
 
 ### Folding keys (`hs-minor-mode`)
 
@@ -189,14 +195,20 @@ warnings (toggle with `wit-ts-mode-check-references`):
 
 Jump between them with `M-x flymake-goto-next-error` /
 `flymake-goto-prev-error`, or list them with `M-x
-flymake-show-buffer-diagnostics`. In Doom, Flymake is enabled automatically
-for `prog-mode` derivatives, so this works out of the box.
+flymake-show-buffer-diagnostics`.
 
 To turn it on for every WIT buffer:
 
 ```elisp
 (add-hook 'wit-ts-mode-hook #'flymake-mode)
 ```
+
+`wit-ts-mode` derives from `prog-mode`, so anything hooked onto
+`prog-mode-hook` applies — but note that Doom only puts `flymake-mode` there
+when the `:checkers syntax` module carries the `+flymake` flag. Its default
+checker is Flycheck, which does not display Flymake backends, so under a
+default Doom configuration these diagnostics stay hidden until you enable
+`flymake-mode` yourself (the two can coexist per buffer).
 
 For a one-off look at *where* a file diverges from the grammar without any
 extra setup, `M-x treesit-explore-mode` shows the live parse tree with
@@ -223,6 +235,12 @@ soon as they parse. Any completion UI that reads
 `completion-at-point-functions` — Corfu, Company, or the built-in
 `completion-at-point` — picks these up automatically; in Doom the configured
 front-end (Corfu or Company) just works.
+
+Each candidate carries its WIT kind (shown as an icon in Corfu/Company and as
+a trailing annotation in `*Completions*`), and — for definition candidates —
+its full signature, the same one Eldoc shows. Corfu's `corfu-popupinfo-mode`
+and Company's doc popup (`company-quickhelp`) display that signature for the
+highlighted candidate, and Company also shows it in the echo area.
 
 ### Cross-file symbols and dependencies
 
@@ -281,10 +299,12 @@ there.
 
 ## Testing
 
-The `examples/` directory holds the sample `.wit` files from the grammar
-repository. Open any of them to exercise highlighting, indentation, imenu,
-folding, and outline. All five parse with zero errors and round-trip through
-`indent-region` unchanged (at their native indent width).
+The `examples/wit/` directory holds the sample `.wit` files from the grammar
+repository. They live under a `wit/` directory so that opening one puts it in
+a recognised project root (see `wit-ts-mode--wit-root`), enabling the
+project-scoped features. Open any of them to exercise highlighting,
+indentation, imenu, folding, and outline. All five parse with zero errors and
+round-trip through `indent-region` unchanged (at their native indent width).
 
 An ERT suite lives in `test/`, with fixtures under `test/resources/`. It
 covers font-lock faces, indentation, imenu, navigation and which-function,

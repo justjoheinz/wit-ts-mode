@@ -319,6 +319,31 @@ above it."
       (outline-hide-subtree)
       (should-not (get-char-property line-a 'invisible)))))
 
+(ert-deftest wit-ts-mode-outline-search-terminates-on-unterminated-last-line ()
+  "Outline traversal must not loop on a heading at a newline-less last line.
+Regression test: typing `{' after `interface x' (or `world x') when
+that declaration is the buffer's final line with no trailing
+newline used to make `wit-ts-mode--outline-search' report the same
+line as the \"next\" heading forever.  Under `outline-minor-mode'
+with buttons this runs on `after-change-functions', producing a
+hard, C-g-proof freeze.  `outline-map-region' must terminate."
+  (skip-unless (treesit-ready-p 'wit t))
+  (require 'outline)
+  (with-temp-buffer
+    (insert "package p:x@0.0.1;\n\ninterface types {")  ; note: no trailing \n
+    (wit-ts-mode)
+    (treesit-parser-create 'wit)
+    ;; A runaway loop here would hang the whole test run rather than fail;
+    ;; a `with-timeout' cannot interrupt the C-level search loop, so the
+    ;; assertion is simply that this call returns at all.
+    (let ((count 0))
+      (outline-map-region (lambda () (setq count (1+ count)))
+                          (point-min) (point-max))
+      (should (= count 1)))
+    ;; Backward search from end-of-buffer must terminate too.
+    (goto-char (point-max))
+    (should (or (wit-ts-mode--outline-search nil t t) t))))
+
 ;;; Completion
 
 (ert-deftest wit-ts-mode-completion-includes-keywords-and-defs ()
@@ -625,6 +650,53 @@ advertises `identity' as its display sort so frontends preserve it."
       (should cand)
       (should (eq (wit-ts-mode--candidate-kind cand) 'interface)))))
 
+(ert-deftest wit-ts-mode-capf-exposes-doc-functions ()
+  "The capf provides Company/Corfu docsig and doc-buffer functions."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface calc {\n  add: func(a: u32) -> u32;\n  ")
+    (wit-ts-mode)
+    (let* ((capf (wit-ts-mode-completion-at-point))
+           (props (nthcdr 3 capf))
+           (docsig (plist-get props :company-docsig))
+           (docbuf (plist-get props :company-doc-buffer))
+           (cand (wit-ts-mode-tests--find-candidate "add" (nth 2 capf))))
+      (should (functionp docsig))
+      (should (functionp docbuf))
+      (should (equal (funcall docsig cand) "add: func(a: u32) -> u32"))
+      (should (equal (with-current-buffer (funcall docbuf cand) (buffer-string))
+                     "add: func(a: u32) -> u32")))))
+
+(ert-deftest wit-ts-mode-candidate-signature-nil-for-non-definition ()
+  "Keywords, builtins and gates have no signature (doc functions return nil).
+Plain strings are used deliberately: completion frontends strip the
+kind text property before calling the doc functions."
+  (skip-unless (treesit-ready-p 'wit t))
+  (should-not (wit-ts-mode--candidate-signature "interface"))
+  (should-not (wit-ts-mode--candidate-signature "u32"))
+  (should-not (wit-ts-mode--candidate-doc-buffer "since")))
+
+(ert-deftest wit-ts-mode-candidate-signature-works-without-kind-property ()
+  "The signature resolves from a plain string, without the kind property.
+Regression: Corfu passes the bare candidate string (no text
+properties) to the doc functions, so resolution must not rely on
+the WIT kind property."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface calc {\n  add: func(a: u32) -> u32;\n}\n")
+    (wit-ts-mode)
+    ;; A bare, unpropertized string -- exactly what Corfu passes.
+    (should (equal (wit-ts-mode--candidate-signature "add")
+                   "add: func(a: u32) -> u32"))))
+
+(ert-deftest wit-ts-mode-candidate-signature-resolves-foreign ()
+  "A foreign path candidate's signature resolves across deps/.
+The candidate is a plain string, as passed by completion frontends."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (should (equal (wit-ts-mode--candidate-signature
+                    "example:dep/dep-iface@0.1.0")
+                   "interface dep-iface { widget, gadget }"))))
+
 ;;; Feature gates (@since / @unstable / @deprecated)
 
 (defun wit-ts-mode-tests--capf-candidates (content)
@@ -828,6 +900,25 @@ field, variant case, enum case, flags field, or resource method
     (should (equal (wit-ts-mode-tests--xref-summaries "widget")
                    '("record widget")))))
 
+(ert-deftest wit-ts-mode-xref-identifier-in-higher-kinded-type ()
+  "A type embedded in a higher-kinded type resolves to a bare name.
+Regression: `<'/`>' were symbol constituents, so the identifier at
+point in `tuple<u64, complex>' or `option<complex>' came back with
+the brackets attached and matched no definition."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "package a:b;\ninterface i {\n  record complex { re: f64, im: f64 }\n"
+            "  type pair = tuple<u64, complex>;\n"
+            "  type maybe = option<complex>;\n}\n")
+    (wit-ts-mode)
+    (dolist (marker '("tuple<u64, comp" "option<comp"))
+      (goto-char (point-min))
+      (search-forward marker)
+      (let ((id (wit-ts-mode--identifier-at-point)))
+        (should (equal id "complex"))
+        (should (equal (wit-ts-mode-tests--xref-summaries id)
+                       '("record complex")))))))
+
 (ert-deftest wit-ts-mode-xref-use-path-to-foreign-interface ()
   "A foreign use_path resolves to the interface in the dep file."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
@@ -864,6 +955,169 @@ field, variant case, enum case, flags field, or resource method
   "An unknown identifier resolves to no definitions."
   (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
     (should-not (wit-ts-mode--xref-find-definitions "no-such-name"))))
+
+;;; Eldoc
+
+(defun wit-ts-mode-tests--eldoc-at (content marker)
+  "Return the Eldoc string for CONTENT with point just after MARKER.
+MARKER is searched from the buffer start; point is left at its end
+\(inside the target identifier).  Returns nil when the Eldoc
+function defers."
+  (with-temp-buffer
+    (insert content)
+    (wit-ts-mode)
+    (goto-char (point-min))
+    (search-forward marker)
+    (let (captured)
+      (wit-ts-mode--eldoc-function (lambda (doc &rest _) (setq captured doc)))
+      (and captured (substring-no-properties captured)))))
+
+(ert-deftest wit-ts-mode-node-signature-formats-each-kind ()
+  "`wit-ts-mode--node-signature' renders each definition kind."
+  (skip-unless (treesit-ready-p 'wit t))
+  (dolist (case '(("interface i { f: func(a: u32) -> string; }" . "f: func(a: u32) -> string")
+                  ("interface i { type n = u64; }" . "type n = u64")
+                  ("interface i { record p { x: u32, y: u32 } }" . "record p { x: u32, y: u32 }")
+                  ("interface i { variant v { a, b(u32) } }" . "variant v { a, b(u32) }")
+                  ("interface i { enum e { on, off } }" . "enum e { on, off }")
+                  ("interface i { flags g { r, w } }" . "flags g { r, w }")))
+    (with-temp-buffer
+      (insert (car case))
+      (wit-ts-mode)
+      (let* ((root (treesit-buffer-root-node))
+             ;; The first member definition inside the interface body.
+             (def (treesit-search-subtree
+                   root wit-ts-mode--defun-node-regexp))
+             ;; Skip the interface_item itself; take its first body child def.
+             (member (treesit-search-subtree
+                      (car (treesit-filter-child
+                            def (lambda (c) (equal (treesit-node-type c) "body"))))
+                      wit-ts-mode--defun-node-regexp))
+             (kind (pcase (treesit-node-type member)
+                     ("func_item" 'func) ("type_item" 'type)
+                     ("record_item" 'record) ("variant_items" 'variant)
+                     ("enum_items" 'enum) ("flags_items" 'flags))))
+        (should (equal (wit-ts-mode--node-signature member kind) (cdr case)))))))
+
+(ert-deftest wit-ts-mode-node-signature-summarises-large-body ()
+  "A body longer than the inline limit is rendered as a member summary.
+The summary lists every field name (no count, no truncation)."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "interface i { record big { aaaaaaaa: u32, bbbbbbbb: u32,"
+            " cccccccc: u32, dddddddd: u32 } }")
+    (wit-ts-mode)
+    (let ((rec (treesit-search-subtree (treesit-buffer-root-node) "record_item")))
+      (should (equal (wit-ts-mode--node-signature rec 'record)
+                     "record big { aaaaaaaa, bbbbbbbb, cccccccc, dddddddd }")))))
+
+(ert-deftest wit-ts-mode-node-signature-lists-all-members ()
+  "The member summary lists all names even for many members (no count).
+Regression against the earlier \"{ N members }\" collapse."
+  (skip-unless (treesit-ready-p 'wit t))
+  (with-temp-buffer
+    (insert "interface big-iface {"
+            " a: func(); b: func(); c: func(); d: func();"
+            " e: func(); f: func(); g: func(); }")
+    (wit-ts-mode)
+    (let* ((iface (treesit-search-subtree (treesit-buffer-root-node)
+                                          "interface_item"))
+           (sig (wit-ts-mode--node-signature iface 'interface)))
+      (should (equal sig "interface big-iface { a, b, c, d, e, f, g }"))
+      ;; No count marker, and the last member survives (nothing truncated).
+      (should-not (string-match-p "members" sig))
+      (should (string-match-p "\\bg\\b" sig)))))
+
+(ert-deftest wit-ts-mode-eldoc-on-definition ()
+  "Eldoc shows the signature when point is on a definition name."
+  (skip-unless (treesit-ready-p 'wit t))
+  (let ((src (concat "package a:b;\ninterface calc {\n  type num = f64;\n"
+                     "  record point { x: num, y: num }\n"
+                     "  add: func(a: num, b: num) -> num;\n}\n")))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "ad")
+                   "add: func(a: num, b: num) -> num"))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "type nu")
+                   "type num = f64"))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "record poi")
+                   "record point { x: num, y: num }"))))
+
+(ert-deftest wit-ts-mode-eldoc-on-reference ()
+  "Eldoc resolves a type reference in a signature to its definition."
+  (skip-unless (treesit-ready-p 'wit t))
+  (let ((src (concat "package a:b;\ninterface calc {\n  type num = f64;\n"
+                     "  record point { x: num, y: num }\n"
+                     "  distance: func(p: point) -> num;\n}\n")))
+    ;; Reference to the `point' record in a parameter type.
+    (should (equal (wit-ts-mode-tests--eldoc-at src "distance: func(p: poi")
+                   "record point { x: num, y: num }"))
+    ;; Reference to the `num' type alias in the return type.
+    (should (equal (wit-ts-mode-tests--eldoc-at src "-> nu")
+                   "type num = f64"))))
+
+(ert-deftest wit-ts-mode-eldoc-on-reference-in-higher-kinded-type ()
+  "Eldoc resolves a type embedded in a higher-kinded type.
+Regression: the mode inherited `<'/`>' as symbol constituents from
+`prog-mode', so `thing-at-point' swallowed them and a name like
+`complex' in `tuple<u64, complex>' or `option<complex>' failed to
+resolve.  A punctuation syntax for `<'/`>' fixes it."
+  (skip-unless (treesit-ready-p 'wit t))
+  (let ((src (concat "package a:b;\ninterface calc {\n"
+                     "  record complex { re: f64, im: f64 }\n"
+                     "  type pair = tuple<u64, complex>;\n"
+                     "  type maybe = option<complex>;\n"
+                     "  type nested = list<tuple<complex, u32>>;\n}\n")))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "tuple<u64, comp")
+                   "record complex { re: f64, im: f64 }"))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "option<comp")
+                   "record complex { re: f64, im: f64 }"))
+    (should (equal (wit-ts-mode-tests--eldoc-at src "list<tuple<comp")
+                   "record complex { re: f64, im: f64 }"))))
+
+(ert-deftest wit-ts-mode-eldoc-defers-when-undefined ()
+  "Eldoc returns nil (defers) for a symbol with no local definition."
+  (skip-unless (treesit-ready-p 'wit t))
+  (should-not (wit-ts-mode-tests--eldoc-at
+               "interface i {\n  f: func() -> unknown-type;\n}\n"
+               "unknown-typ")))
+
+(defun wit-ts-mode-tests--eldoc-here ()
+  "Return the Eldoc string at point in the current buffer, or nil."
+  (let (captured)
+    (wit-ts-mode--eldoc-function (lambda (doc &rest _) (setq captured doc)))
+    (and captured (substring-no-properties captured))))
+
+(ert-deftest wit-ts-mode-eldoc-resolves-sibling-bare-name ()
+  "A bare name defined in a sibling file (same package) resolves."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    ;; `sibling-iface' lives in sibling.wit under the same package.
+    (insert "\nworld w {\n  export sibling-iface;\n}\n")
+    (goto-char (point-max))
+    (search-backward "sibling-iface")
+    (goto-char (1+ (point)))
+    (should (equal (wit-ts-mode-tests--eldoc-here)
+                   "interface sibling-iface { timestamp, ping }"))))
+
+(ert-deftest wit-ts-mode-eldoc-resolves-foreign-interface ()
+  "A qualified use path resolves to a foreign interface under deps/."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  import example:dep/dep-iface@0.1.0;\n}\n")
+    (goto-char (point-max))
+    (search-backward "dep-iface")
+    (goto-char (1+ (point)))
+    (should (equal (wit-ts-mode-tests--eldoc-here)
+                   "interface dep-iface { widget, gadget }"))))
+
+(ert-deftest wit-ts-mode-eldoc-resolves-foreign-world-in-include ()
+  "An include path resolves to a foreign world under deps/."
+  (wit-ts-mode-tests--with-project-file "proj/wit/root.wit"
+    (goto-char (point-max))
+    (insert "\nworld w {\n  include example:dep/dep-world@0.1.0;\n}\n")
+    (goto-char (point-max))
+    (search-backward "dep-world")
+    (goto-char (1+ (point)))
+    (should (equal (wit-ts-mode-tests--eldoc-here) "world dep-world"))))
 
 ;;; Read-only dependency files
 

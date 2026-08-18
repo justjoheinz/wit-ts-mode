@@ -6,7 +6,7 @@
 ;; Assisted-by: claude:claude-opus-4-8
 ;; URL: https://github.com/justjoheinz/wit-ts-mode
 ;; Keywords: languages wasm wit
-;; Version: 0.1.0
+;; Version: 0.1.2
 ;; Package-Requires: ((emacs "30.1"))
 ;; SPDX-License-Identifier: Apache-2.0
 
@@ -40,6 +40,7 @@
 (require 'cl-lib)
 (require 'treesit)
 (require 'hideshow)
+(require 'eldoc)
 (require 'flymake)
 (require 'outline)
 (require 'seq)
@@ -425,6 +426,15 @@ the completion annotation and `company-kind' functions."
   "Tree-sitter query capturing names of top-level WIT definitions.
 Each capture name is the WIT kind of the matched definition (see
 `wit-ts-mode--kinded'), so callers can label candidates by kind.")
+
+(defvar wit-ts-mode--defun-node-regexp
+  (rx bos (or "world_item" "interface_item" "func_item"
+              "record_item" "variant_items" "enum_items"
+              "flags_items" "resource_item" "type_item")
+      eos)
+  "Regexp of node types treated as defuns in `wit-ts-mode'.
+These are the whole-definition nodes: a defun for navigation, the
+climb target for Eldoc, and the outline/defun boundary.")
 
 (defun wit-ts-mode--kinded-captures (root query)
   "Return kinded candidate strings for QUERY captured under ROOT.
@@ -1226,7 +1236,12 @@ buffer.  Suitable for `completion-at-point-functions'."
               ;; Surface each candidate's WIT kind: as trailing text in the
               ;; `*Completions*' buffer, and as an icon in Corfu/Company.
               :annotation-function #'wit-ts-mode--completion-annotation
-              :company-kind #'wit-ts-mode--candidate-company-kind)))))
+              :company-kind #'wit-ts-mode--candidate-company-kind
+              ;; Full signature for the highlighted candidate: Company shows
+              ;; it in the echo area (`docsig'), and Corfu/Company render it
+              ;; in a doc popup (`doc-buffer'), mirroring Eldoc.
+              :company-docsig #'wit-ts-mode--candidate-docsig
+              :company-doc-buffer #'wit-ts-mode--candidate-doc-buffer)))))
 
 (defun wit-ts-mode--completion-annotation (candidate)
   "Return the annotation string for completion CANDIDATE, or nil.
@@ -1241,6 +1256,49 @@ Reads the candidate's WIT kind (see `wit-ts-mode--kinded') and
 maps it through `wit-ts-mode--kind-company-kinds'."
   (cdr (assq (wit-ts-mode--candidate-kind candidate)
              wit-ts-mode--kind-company-kinds)))
+
+(defun wit-ts-mode--candidate-signature (candidate)
+  "Return the one-line WIT signature for completion CANDIDATE, or nil.
+CANDIDATE is resolved the way Eldoc resolves a symbol (reusing
+`wit-ts-mode--node-signature'): a foreign `pkg/name@version' path
+in the named package, a bare name in the current buffer then
+elsewhere in the project.  Keywords, builtin types and
+feature-gate names are skipped -- they name no definition -- so
+that scrolling past them does not trigger a project-wide scan.
+Return nil when CANDIDATE names no resolvable definition.
+
+The candidate's WIT kind text property is deliberately not
+consulted: completion frontends (e.g. Corfu) strip text properties
+before calling the doc functions, so resolution must work from the
+plain string alone."
+  (let ((text (substring-no-properties candidate)))
+    (unless (or (member text wit-ts-mode--keywords)
+                (member text wit-ts-mode--builtin-types)
+                (member text wit-ts-mode--gates))
+      (let* ((split (wit-ts-mode--split-use-path text))
+             (package (car split))
+             (name (cdr split))
+             (result (or (and (null package)
+                              (wit-ts-mode--local-signature name))
+                         (wit-ts-mode--project-signature name package))))
+        (car result)))))
+
+(defun wit-ts-mode--candidate-docsig (candidate)
+  "Return CANDIDATE's signature for Company's echo-area `docsig'.
+See `wit-ts-mode--candidate-signature'."
+  (wit-ts-mode--candidate-signature candidate))
+
+(defun wit-ts-mode--candidate-doc-buffer (candidate)
+  "Return a buffer describing CANDIDATE, for doc popups, or nil.
+Read by `corfu-popupinfo-mode' and `company' (its `doc-buffer'
+command, used by `company-quickhelp').  Contains the candidate's
+one-line signature (see `wit-ts-mode--candidate-signature')."
+  (when-let* ((sig (wit-ts-mode--candidate-signature candidate)))
+    (with-current-buffer (get-buffer-create " *wit-ts-mode-doc*")
+      (erase-buffer)
+      (insert sig)
+      (goto-char (point-min))
+      (current-buffer))))
 
 (defun wit-ts-mode--in-use-names-list-p ()
   "Return non-nil when point is in a `use PATH.{ ... }' names list."
@@ -1422,6 +1480,217 @@ current buffer first, then the other `.wit' files under the
              (treesit-parser-root-node parser)
              wit-ts-mode--completion-defs-query))))
 
+;;; Eldoc
+
+;; Eldoc shows the definition of the symbol at point in the echo area.  It
+;; reuses the xref resolver's model: `wit-ts-mode--identifier-at-point'
+;; names what point is on, and the definition node is located in the buffer
+;; (Tier 1) or, failing that, across the project's files (Tier 2).  The
+;; located node is rendered to a one-line signature by
+;; `wit-ts-mode--node-signature'.
+
+(defun wit-ts-mode--collapse-whitespace (string)
+  "Return STRING with whitespace collapsed to single spaces, trimmed.
+A trailing statement `;' is also dropped."
+  (string-remove-suffix
+   ";"
+   (string-trim (replace-regexp-in-string "[ \t\n\r]+" " " string))))
+
+(defun wit-ts-mode--node-body (node)
+  "Return NODE's `body' child, or nil.
+The grammar makes the braced body an unnamed-field named child, so
+it is looked up by node type rather than by field name."
+  (car (treesit-filter-child
+        node (lambda (c) (equal (treesit-node-type c) "body")))))
+
+(defun wit-ts-mode--node-header-text (node)
+  "Return NODE's text up to (but excluding) its `body' child, collapsed.
+For a definition with a braced body (record, variant, interface,
+...) this is the head, e.g. \"record point\" or \"interface
+streams\".  When NODE has no body the whole node text is used."
+  (let* ((body (wit-ts-mode--node-body node))
+         (end (if body (treesit-node-start body) (treesit-node-end node)))
+         (text (buffer-substring-no-properties (treesit-node-start node) end)))
+    (wit-ts-mode--collapse-whitespace text)))
+
+(defconst wit-ts-mode--signature-member-queries
+  '((record   . ((record_field name: (id) @m)))
+    (variant  . ((variant_case name: (id) @m)))
+    (enum     . ((enum_case) @m))
+    (flags    . ((flags_field) @m))
+    (resource . ((func_item name: (id) @m)))
+    (interface . ((interface_item (body (func_item name: (id) @m)))
+                  (interface_item (body ((type_item alias: (id) @m))))
+                  (interface_item (body (record_item name: (id) @m)))
+                  (interface_item (body (variant_items name: (id) @m)))
+                  (interface_item (body (enum_items name: (id) @m)))
+                  (interface_item (body (flags_items name: (id) @m)))
+                  (interface_item (body (resource_item name: (id) @m))))))
+  "Alist mapping a container WIT kind to a query for its member names.
+Used by `wit-ts-mode--node-signature' to summarise the members of a
+definition whose full body is too large to show inline.")
+
+(defun wit-ts-mode--node-member-names (node kind)
+  "Return the member names of container NODE of KIND, in source order.
+KIND is a symbol key of `wit-ts-mode--signature-member-queries';
+return nil when KIND has no member query."
+  (when-let* ((query (cdr (assq kind wit-ts-mode--signature-member-queries))))
+    (mapcar (lambda (cap) (treesit-node-text (cdr cap) t))
+            (treesit-query-capture node query nil nil nil))))
+
+(defcustom wit-ts-mode-eldoc-inline-body-limit 60
+  "Maximum length of a definition body shown inline by Eldoc.
+When a record/variant/enum/flags definition's full one-line form is
+no longer than this, Eldoc shows it verbatim; otherwise it shows
+the head plus a summary of member names.  Interfaces, worlds and
+resources always use the summary form."
+  :type 'natnum
+  :group 'wit-ts-mode)
+
+(defun wit-ts-mode--node-signature (node kind)
+  "Return a one-line signature string for definition NODE of KIND.
+KIND is the WIT kind symbol (see `wit-ts-mode--completion-defs-query').
+Functions and type aliases render as their (collapsed) source text.
+Records, variants, enums and flags render inline when short (see
+`wit-ts-mode-eldoc-inline-body-limit') and as a head plus member
+summary otherwise.  Interfaces, worlds and resources always render
+as a head plus member summary.  Return nil when NODE is nil."
+  (when node
+    (pcase kind
+      ((or 'func 'type)
+       (wit-ts-mode--collapse-whitespace (treesit-node-text node t)))
+      ((or 'record 'variant 'enum 'flags)
+       (let ((full (wit-ts-mode--collapse-whitespace (treesit-node-text node t))))
+         (if (<= (length full) wit-ts-mode-eldoc-inline-body-limit)
+             full
+           (wit-ts-mode--node-signature-summary node kind))))
+      ((or 'interface 'world 'resource)
+       (wit-ts-mode--node-signature-summary node kind))
+      (_ (wit-ts-mode--collapse-whitespace (treesit-node-text node t))))))
+
+(defun wit-ts-mode--node-signature-summary (node kind)
+  "Return a head-plus-member-summary signature for NODE of KIND.
+The head is NODE's declaration up to its body (e.g. \"record
+point\" or \"interface streams\"); the summary lists every member
+name, e.g. \"{ x, y }\".  All names are included -- the result is a
+single logical line, and Eldoc frontends (the multiline echo area
+or `eldoc-box') wrap it as needed.  When NODE has no members the
+bare head is returned."
+  (let* ((head (wit-ts-mode--node-header-text node))
+         (members (wit-ts-mode--node-member-names node kind)))
+    (if members
+        (format "%s { %s }" head (string-join members ", "))
+      head)))
+
+(defun wit-ts-mode--definition-in-root (root name)
+  "Return (NODE . KIND) for the definition of NAME under ROOT.
+NODE is the whole definition node (e.g. a `func_item') and KIND its
+WIT kind symbol.  Return nil when ROOT has no such definition.  The
+first match in document order wins."
+  (catch 'found
+    (dolist (def (wit-ts-mode--definitions-in-node
+                  root wit-ts-mode--completion-defs-query))
+      (when (equal (plist-get def :name) name)
+        ;; :node is the name id; climb to the enclosing definition node.
+        (when-let* ((item (treesit-parent-until
+                           (plist-get def :node)
+                           (lambda (n)
+                             (string-match-p wit-ts-mode--defun-node-regexp
+                                             (treesit-node-type n)))
+                           t)))
+          (throw 'found (cons item (plist-get def :kind))))))))
+
+(defun wit-ts-mode--local-signature (name)
+  "Return a (SIGNATURE . KIND) cons for NAME defined in the current buffer.
+Return nil when no such definition exists."
+  (when-let* ((parser (wit-ts-mode--parser))
+              (def (wit-ts-mode--definition-in-root
+                    (treesit-parser-root-node parser) name)))
+    (cons (wit-ts-mode--node-signature (car def) (cdr def)) (cdr def))))
+
+(defun wit-ts-mode--project-signature (name package)
+  "Return a (SIGNATURE . KIND) cons for NAME defined elsewhere in the project.
+Scans the `.wit' files under the WIT root (see
+`wit-ts-mode--wit-root'), excluding the current buffer's own file.
+When PACKAGE is non-nil, only files declaring that package match;
+otherwise files sharing the current buffer's package (siblings)
+match, so a bare NAME resolves within its own package.  Each
+candidate file is parsed in a temporary buffer and its matching
+definition rendered there (the signature is a string, so it
+outlives that buffer).  Return nil when NAME is not found."
+  (when-let* ((roots (wit-ts-mode--wit-root))
+              (wit-root (car roots)))
+    (let ((own-pkg (wit-ts-mode--buffer-package-id))
+          (self (and buffer-file-name (expand-file-name buffer-file-name))))
+      (catch 'found
+        (dolist (file (directory-files-recursively wit-root "\\.wit\\'"))
+          (unless (equal (expand-file-name file) self)
+            (when (treesit-ready-p 'wit t)
+              (ignore-errors
+                (with-temp-buffer
+                  (insert-file-contents file)
+                  (let* ((parser (treesit-parser-create 'wit))
+                         (root (treesit-parser-root-node parser))
+                         (pkg (wit-ts-mode--package-id-from-decl-head
+                               (car (treesit-query-capture
+                                     root wit-ts-mode--completion-packages-query
+                                     nil nil t))))
+                         (match (if package
+                                    (equal pkg package)
+                                  (and own-pkg (equal pkg own-pkg)))))
+                    (when match
+                      (when-let* ((def (wit-ts-mode--definition-in-root
+                                        root name)))
+                        (throw 'found
+                               (cons (wit-ts-mode--node-signature
+                                      (car def) (cdr def))
+                                     (cdr def)))))))))))))))
+
+(defun wit-ts-mode--eldoc-target-at-point ()
+  "Return (NAME . PACKAGE) Eldoc should document at point, or nil.
+For a qualified `use'/`import' path (e.g. `wasi:io/streams@0.2.0')
+PACKAGE is the package id and NAME the interface; for its names
+list NAME is the member and PACKAGE nil.  For a bare symbol NAME is
+the symbol and PACKAGE nil.  Any @version is dropped."
+  (when-let* ((id (wit-ts-mode--identifier-at-point)))
+    (if (get-text-property 0 wit-ts-mode--xref-path-property id)
+        (let ((split (wit-ts-mode--split-use-path
+                      (string-remove-suffix "." id))))
+          (cons (cdr split) (car split)))
+      (cons (substring-no-properties id) nil))))
+
+(defun wit-ts-mode--eldoc-function (callback &rest _)
+  "Eldoc backend for `wit-ts-mode': document the symbol at point.
+Resolves the name at point to a definition -- first in the current
+buffer, then across the project's files and resolved dependencies
+\(see `wit-ts-mode--project-signature') -- and shows its one-line
+signature (see `wit-ts-mode--node-signature') via CALLBACK.
+Suitable for `eldoc-documentation-functions'.  Return non-nil when
+it defers to CALLBACK, per the Eldoc protocol."
+  (when-let* ((target (wit-ts-mode--eldoc-target-at-point))
+              (name (car target))
+              ;; PACKAGE may legitimately be nil (a bare name), so resolve it
+              ;; outside the `when-let*' guard: a bare name resolves in the
+              ;; current buffer first, then the project; a qualified path
+              ;; names a specific (usually foreign) package and skips the
+              ;; local buffer.
+              (result (let ((package (cdr target)))
+                        (or (and (null package)
+                                 (wit-ts-mode--local-signature name))
+                            (wit-ts-mode--project-signature name package))))
+              (sig (car result)))
+    (funcall callback sig
+             :thing name
+             :face (wit-ts-mode--eldoc-face (cdr result)))
+    t))
+
+(defun wit-ts-mode--eldoc-face (kind)
+  "Return the face Eldoc should use for a symbol of WIT KIND."
+  (pcase kind
+    ('func 'font-lock-function-name-face)
+    ((or 'interface 'world) 'font-lock-function-name-face)
+    (_ 'font-lock-type-face)))
+
 ;;; Folding
 
 ;; Translation of queries/folds.scm.  The grammar folds on `(body)' nodes
@@ -1522,6 +1791,15 @@ For BOUND, MOVE, BACKWARD, and LOOKING-AT see `outline-search-function'."
         (catch 'done
           (while (if backward (not (bobp)) (not (eobp)))
             (forward-line step)
+            ;; When the buffer ends in a line with no trailing newline,
+            ;; `forward-line 1' from that line lands at end-of-buffer but
+            ;; leaves point on the *same* line (not at beginning-of-line).
+            ;; Re-checking that line would report the heading we started from
+            ;; as the "next" one, so `outline-map-region'/`outline-next-heading'
+            ;; would loop forever (a hard, C-g-proof freeze).  Stop instead of
+            ;; re-examining the line.
+            (when (and (not backward) (not (bolp)))
+              (throw 'done nil))
             (when (and bound (if backward (< (point) bound) (> (point) bound)))
               (throw 'done nil))
             (when (wit-ts-mode--outline-heading-on-line-p)
@@ -1536,13 +1814,6 @@ For BOUND, MOVE, BACKWARD, and LOOKING-AT see `outline-search-function'."
         nil))))
 
 ;;; Navigation
-
-(defvar wit-ts-mode--defun-node-regexp
-  (rx bos (or "world_item" "interface_item" "func_item"
-              "record_item" "variant_items" "enum_items"
-              "flags_items" "resource_item" "type_item")
-      eos)
-  "Regexp of node types treated as defuns in `wit-ts-mode'.")
 
 (defvar wit-ts-mode--thing-settings
   `((wit
@@ -1975,6 +2246,22 @@ Project-tool commands live under the major-mode-reserved
   "C-c C-u" #'wit-ts-deps-update
   "C-c C-b" #'wit-ts-generate)
 
+(defvar wit-ts-mode--syntax-table
+  (let ((table (make-syntax-table prog-mode-syntax-table)))
+    ;; WIT identifiers are kebab-case (e.g. `wall-clock'), so `-' is a
+    ;; symbol constituent; `%' introduces a raw identifier (e.g. `%func').
+    (modify-syntax-entry ?- "_" table)
+    (modify-syntax-entry ?% "_" table)
+    ;; `<' and `>' only ever delimit generic type arguments (`list<T>',
+    ;; `tuple<u64, complex>'); as punctuation they stop `thing-at-point'
+    ;; from swallowing them, so a type embedded in a higher-kinded type
+    ;; resolves for Eldoc and xref.  `prog-mode' inherits them as symbol
+    ;; constituents, which is why the override is needed.
+    (modify-syntax-entry ?< "." table)
+    (modify-syntax-entry ?> "." table)
+    table)
+  "Syntax table for `wit-ts-mode'.")
+
 ;;;###autoload
 (define-derived-mode wit-ts-mode prog-mode "WIT"
   "Major mode for editing WIT (WebAssembly Interface Type) files.
@@ -2034,6 +2321,7 @@ Generation:
 
 \\{wit-ts-mode-map}"
   :group 'wit-ts
+  :syntax-table wit-ts-mode--syntax-table
   (wit-ts-mode--ensure-grammar)
 
   (setq wit-ts-mode--flymake-parser (treesit-parser-create 'wit))
@@ -2092,6 +2380,9 @@ Generation:
   ;; Cross-reference: jump to definitions with `xref-find-definitions'
   ;; (\\[xref-find-definitions]), across the buffer and project files.
   (add-hook 'xref-backend-functions #'wit-ts-mode--xref-backend nil t)
+
+  ;; Eldoc: show the signature of the definition at point in the echo area.
+  (add-hook 'eldoc-documentation-functions #'wit-ts-mode--eldoc-function nil t)
 
   ;; Dependency files (under DIR/deps/) are fetched artifacts, so visit
   ;; them read-only -- e.g. when jumping to a definition there.
