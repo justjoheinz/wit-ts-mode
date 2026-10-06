@@ -73,6 +73,18 @@ Doom Emacs places it under `~/.config/emacs/.local/cache/tree-sitter/`, which
 (add-to-list 'treesit-extra-load-path "/path/to/your/tree-sitter/")
 ```
 
+The grammar is installed from its default branch. The node types and
+queries in this mode were verified against the revision recorded in
+`wit-ts-mode-grammar-reference-revision`; diff the grammar against that
+commit when auditing a grammar update. Emacs 30's installer can only check
+out a branch or a tag, never a bare commit, so the revision is documented
+rather than pinned.
+
+If you already have an older `wit` grammar installed, rebuild it with
+`make grammar` (or `M-x treesit-install-language-grammar`). The test suite
+fails on a grammar older than that revision rather than skipping, so an
+out-of-date local grammar is reported rather than silently tolerated.
+
 ## Installing the mode
 
 ### With `use-package` and `:vc` (Emacs 30+)
@@ -164,9 +176,11 @@ Turn it on with `M-x which-function-mode`, or from `wit-ts-mode-hook`.
 ### Outline (`outline-minor-mode`)
 
 `TAB` / `S-TAB` cycle a heading's visibility; `C-c @ C-q` shows only
-top-level headings. Headings are the package declaration and each
-world/interface plus their members — derived from the parse tree, not
-regexps.
+top-level headings. Headings are each world/interface and each of their
+members — `import`, `export`, `include`, `use`, functions, and type
+definitions — derived from the parse tree, not regexps. Single-line
+members are headings too, so folding a block never swallows the
+declarations that follow it.
 
 ### Syntax checking (`flymake-mode`)
 
@@ -309,7 +323,11 @@ round-trip through `indent-region` unchanged (at their native indent width).
 An ERT suite lives in `test/`, with fixtures under `test/resources/`. It
 covers font-lock faces, indentation, imenu, navigation and which-function,
 Flymake diagnostics, and completion. Every test skips itself (rather than
-failing) when the grammar is unavailable, so it is safe to run anywhere.
+failing) when the grammar is *unavailable*, so it is safe to run anywhere. An
+*outdated* grammar is a different matter and does fail, naming the revision
+required and the command to rebuild — see
+`wit-ts-mode-typedef-item-types-match-grammar`, which also pins the
+mode's node-type categories to the grammar's own `typedef_item` supertype.
 
 Common tasks are wrapped in a `Makefile`:
 
@@ -329,5 +347,5 @@ matrix of Emacs versions (see `.github/workflows/ci.yml`).
 
 Apache License 2.0. See the [`LICENSE`](LICENSE) file for the full text.
 
-[wit]: https://component-model.bytecodealliance.org/design/wit.html
+[wit]: https://github.com/WebAssembly/component-model/blob/main/design/mvp/WIT.md
 [grammar]: https://github.com/bytecodealliance/tree-sitter-wit

@@ -23,6 +23,14 @@
 ;; https://github.com/bytecodealliance/tree-sitter-wit and mirrors the
 ;; highlighting captures from that project's queries/highlights.scm.
 ;;
+;; That grammar follows the draft WIT specification at
+;; https://github.com/WebAssembly/component-model/blob/main/design/mvp/WIT.md
+;; which is the reference this mode's spec-derived behaviour is checked against.
+;;
+;; The node types and queries below were verified against the grammar
+;; revision named by `wit-ts-mode-grammar-reference-revision'; see that
+;; variable when auditing a grammar update.
+;;
 ;; Installation:
 ;;
 ;;   Loading this file registers the grammar's upstream source in
@@ -77,6 +85,23 @@ Emacs 30."
   "https://github.com/bytecodealliance/tree-sitter-wit"
   "URL of the tree-sitter grammar used by `wit-ts-mode'.")
 
+(defconst wit-ts-mode-grammar-reference-revision
+  "f777cdbe11281ccc68ffa30bd7ea34cdf4ddbec6"
+  "Grammar revision this mode's node types and queries were verified against.
+A commit of the repository named by `wit-ts-mode-grammar-url'.
+Deliberately *not* passed to `treesit-install-language-grammar':
+the grammar is installed from the default branch, because Emacs
+30's installer can only check out a branch or a tag, never a bare
+commit.  It is recorded here as the point of reference for
+auditing a grammar update -- diff the grammar against it and the
+node types grouped below are what has to be rechecked.
+
+The ERT suite treats it as a floor: an installed grammar older
+than this fails `wit-ts-mode-typedef-item-types-match-grammar'
+rather than skipping it, so a stale local grammar is reported
+instead of quietly validating the mode against an unaudited
+revision.  Rebuild with `make grammar'.")
+
 (defun wit-ts-mode--register-grammar-source ()
   "Register the WIT grammar in `treesit-language-source-alist'.
 Done lazily (only when the mode is used) so that merely loading
@@ -100,6 +125,48 @@ Install it now? "))
 run `M-x treesit-install-language-grammar RET wit RET'")))
   (unless (treesit-ready-p 'wit)
     (error "The WIT tree-sitter grammar (`wit') could not be loaded")))
+
+;;; Grammar node categories
+
+;; The grammar groups its items under five supertypes: `statement',
+;; `package_items', `world_definition', `typedef_item' and `gate_item'.
+;; Supertypes are hidden rules -- they do not appear in the parse tree and
+;; `treesit-node-type' always reports the concrete node -- and a supertype
+;; pattern in a query may not carry fields or children, only narrow to a
+;; member (`typedef_item/record_item').  So the queries further down still
+;; name concrete nodes, and Lisp-side matching has to spell each category
+;; out.  Spelling them out once here is what keeps the derived regexps
+;; (defun, outline, imenu, navigation) in step with the grammar.
+
+(defun wit-ts-mode--node-type-regexp (&rest type-lists)
+  "Return a regexp matching exactly one of the node types in TYPE-LISTS.
+TYPE-LISTS are lists of node-type strings; they are concatenated.
+Anchored at both ends, so the result is suitable for
+`treesit-defun-type-regexp' and `treesit-simple-imenu-settings'.
+The lists are copied before being handed to `regexp-opt', which
+sorts in place, so the constants that name the categories keep
+their declaration order."
+  (concat "\\`" (regexp-opt (mapcan #'copy-sequence type-lists)) "\\'"))
+
+(defconst wit-ts-mode--typedef-item-types
+  '("type_item" "record_item" "variant_items" "enum_items"
+    "flags_items" "resource_item")
+  "Node types of the grammar's `typedef_item' supertype.
+The type and resource definitions that may appear in an interface
+body or a world body.")
+
+(defconst wit-ts-mode--world-definition-types
+  '("import_item" "export_item" "include_item" "use_item")
+  "Node types of the grammar's `world_definition' supertype, minus typedefs.
+The members of a world body other than the type definitions in
+`wit-ts-mode--typedef-item-types'.  A bare `use_item' also occurs
+in an interface body.")
+
+(defconst wit-ts-mode--package-item-types
+  '("world_item" "interface_item" "toplevel_use_item")
+  "Node types of the grammar's `package_items' supertype.
+The declarations that may appear at the top level of a file or
+inside a `nested_package_definition'.")
 
 ;;; Customization
 
@@ -246,11 +313,16 @@ interface.  Requires `flymake-mode' to show results."
 
    :language 'wit
    :feature 'attribute
-   ;; Feature gates with a leading `@', e.g. `@since', `@unstable',
-   ;; `@deprecated'.  `:anchor' is the s-expression form of the query
-   ;; anchor `.'.
-   '((_ :anchor "@" @font-lock-preprocessor-face
-        :anchor ["since" "unstable" "deprecated"] @font-lock-builtin-face))
+   ;; Feature gates with a leading `@'.  These are exactly the members of
+   ;; the grammar's `gate_item' supertype; they are named individually
+   ;; because a supertype pattern cannot carry children, and naming them
+   ;; beats matching a wildcard node against every node in the tree.
+   '((since_gate "@" @font-lock-preprocessor-face
+                 "since" @font-lock-builtin-face)
+     (unstable_gate "@" @font-lock-preprocessor-face
+                    "unstable" @font-lock-builtin-face)
+     (deprecated_gate "@" @font-lock-preprocessor-face
+                      "deprecated" @font-lock-builtin-face))
 
    :language 'wit
    :feature 'type
@@ -428,13 +500,14 @@ Each capture name is the WIT kind of the matched definition (see
 `wit-ts-mode--kinded'), so callers can label candidates by kind.")
 
 (defvar wit-ts-mode--defun-node-regexp
-  (rx bos (or "world_item" "interface_item" "func_item"
-              "record_item" "variant_items" "enum_items"
-              "flags_items" "resource_item" "type_item")
-      eos)
+  (wit-ts-mode--node-type-regexp
+   '("world_item" "interface_item" "func_item")
+   wit-ts-mode--typedef-item-types)
   "Regexp of node types treated as defuns in `wit-ts-mode'.
 These are the whole-definition nodes: a defun for navigation, the
-climb target for Eldoc, and the outline/defun boundary.")
+climb target for Eldoc, and the outline/defun boundary.  A
+`toplevel_use_item' is a `package_items' member but not a
+definition, so it is not a defun.")
 
 (defun wit-ts-mode--kinded-captures (root query)
   "Return kinded candidate strings for QUERY captured under ROOT.
@@ -1056,8 +1129,12 @@ command-line arguments."
       (setq cur (treesit-node-parent cur)))
     found))
 
+;; The character sets below use `rx's `in' form rather than its exact
+;; synonym `any': Emacs 31 added a function named `any', so `package-lint'
+;; reads `(any ...)' inside `rx' as a call to it and demands an (emacs
+;; "31.1") dependency this mode does not want.  `in' names no function.
 (defconst wit-ts-mode--use-path-context-regexp
-  (rx (or bos (any ?\; ?{ ?} ?\n))
+  (rx (or bos (in ?\; ?{ ?} ?\n))
       (* space)
       ;; Group 1 is the introducing keyword, so callers can distinguish an
       ;; `include' (which names a world) from `import'/`export'/`use'
@@ -1070,7 +1147,7 @@ command-line arguments."
       ;; `import NAME: extern-type' form (space after `:') breaks the run
       ;; and falls through to default completion, as intended.  A `{' also
       ;; breaks it, ending the path before a `use PATH.{...}' names body.
-      (* (any alnum ?_ ?% ?: ?/ ?@ ?- ?.))
+      (* (in alnum ?_ ?% ?: ?/ ?@ ?- ?.))
       eos)
   "Regexp matching an `import'/`export'/`use'/`include' path up to point.
 Matched against the buffer text from the enclosing statement's
@@ -1156,14 +1233,14 @@ alias contributes the imported name x."
     (cons start end)))
 
 (defconst wit-ts-mode--gate-name-regexp
-  (rx "@" (group (* (any alnum ?_ ?-))) eos)
+  (rx "@" (group (* (in alnum ?_ ?-))) eos)
   "Regexp matching a feature-gate attribute name typed after `@'.
 Group 1 is the (possibly empty) gate name up to point, e.g. the
 `sin' of `@sin'.")
 
 (defconst wit-ts-mode--gate-field-regexp
-  (rx "@" (group (+ (any alnum ?_ ?-)))       ; the gate name
-      "(" (* (not (any ?\) ?\n)))             ; inside the parens, up to point
+  (rx "@" (group (+ (in alnum ?_ ?-)))        ; the gate name
+      "(" (* (not (in ?\) ?\n)))              ; inside the parens, up to point
       eos)
   "Regexp matching an in-progress feature-gate field, e.g. `@since(ver'.
 Group 1 is the gate name; a match means point is inside the gate's
@@ -1715,18 +1792,21 @@ Replaces the obsolete (Emacs 31.1) `hs-special-modes-alist' entry."
 ;;; Outline
 
 (defvar wit-ts-mode--outline-node-regexp
-  (rx bos (or "world_item" "interface_item"
-              "func_item" "type_item" "record_item"
-              "variant_items" "enum_items" "flags_items" "resource_item"
-              "import_item" "export_item" "toplevel_use_item")
-      eos)
+  (wit-ts-mode--node-type-regexp
+   wit-ts-mode--package-item-types
+   '("func_item")
+   wit-ts-mode--typedef-item-types
+   wit-ts-mode--world-definition-types)
   "Regexp of node types treated as outline headings in `wit-ts-mode'.
 All top-level and member declarations are headings, including
 single-line ones such as `type t = u32;'.  A single-line item is
 a childless (leaf) heading; this is required so that outline can
 bound the *preceding* multi-line block correctly.  Marking only
 multi-line nodes would make a fold like `flags { ... }' swallow
-every declaration after it, up to the next multi-line heading.")
+every declaration after it, up to the next multi-line heading.
+That is why the whole of `wit-ts-mode--world-definition-types' is
+covered and not just `import'/`export': a trailing `use' or
+`include' line would otherwise be swallowed by the fold above it.")
 
 ;; `wit-ts-mode' uses a custom `outline-search-function' rather than the
 ;; built-in `treesit-outline-predicate'.  The built-in anchors headings by
@@ -1829,11 +1909,13 @@ For BOUND, MOVE, BACKWARD, and LOOKING-AT see `outline-search-function'."
      (list ,(rx bos (or "body" "func_type" "tuple" "tuple_list"
                         "list" "option" "result")
                 eos))
-     ;; A single declaration or member, for `forward-sentence'.
-     (sentence ,(rx bos (or "type_item" "record_field" "variant_case"
-                            "enum_case" "flags_field" "func_item"
-                            "use_item" "import_item" "export_item")
-                    eos))
+     ;; A single declaration or member, for `forward-sentence': the
+     ;; one-liners of a world body (`wit-ts-mode--world-definition-types')
+     ;; plus the one-liners of a type body.
+     (sentence ,(wit-ts-mode--node-type-regexp
+                 wit-ts-mode--world-definition-types
+                 '("type_item" "record_field" "variant_case"
+                   "enum_case" "flags_field" "func_item")))
      ;; Comments and strings behave as free text.
      (text ,(rx bos (or "line_comment" "block_comment" "string_literal")
                 eos))))
@@ -2355,9 +2437,8 @@ Generation:
   (setq-local treesit-simple-imenu-settings
               `(("World" "\\`world_item\\'" nil nil)
                 ("Interface" "\\`interface_item\\'" nil nil)
-                ("Type" ,(rx bos (or "record_item" "variant_items" "enum_items"
-                                     "flags_items" "resource_item" "type_item")
-                             eos)
+                ("Type" ,(wit-ts-mode--node-type-regexp
+                          wit-ts-mode--typedef-item-types)
                  nil nil)
                 ("Function" "\\`func_item\\'" nil nil)))
 

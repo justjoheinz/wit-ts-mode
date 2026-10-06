@@ -58,6 +58,49 @@ Skips the test if the WIT grammar is not ready."
     (should-not (treesit-query-capture
                  (treesit-buffer-root-node) '((ERROR) @e) nil nil t))))
 
+;;; Grammar node categories
+
+(ert-deftest wit-ts-mode-typedef-item-types-match-grammar ()
+  "`wit-ts-mode--typedef-item-types' lists exactly the grammar's typedef items.
+The grammar publishes that grouping as its `typedef_item'
+supertype, so this pins the hand-maintained copy to the grammar
+itself: a typedef item added or removed upstream fails here rather
+than silently degrading outline, imenu and defun navigation, all
+of which derive their node sets from the constant.
+
+Also fails -- deliberately, rather than skipping -- when the
+installed grammar predates the supertype.  A stale grammar is
+something to fix, and skipping would hide exactly the signal that
+says so; it would also mean the rest of the suite silently
+validates the mode against a grammar revision nobody has audited."
+  (skip-unless (treesit-ready-p 'wit t))
+  (unless (ignore-errors (treesit-query-compile 'wit '((typedef_item) @t) t))
+    (ert-fail
+     (format "The installed `wit' grammar has no `typedef_item' supertype, \
+so it is older than %s.  Rebuild it with `make grammar'."
+             wit-ts-mode-grammar-reference-revision)))
+  (with-temp-buffer
+    ;; One of every typedef item, so the captured set is the whole category.
+    (insert "package a:b;\ninterface i {\n"
+            "  type t = u32;\n"
+            "  record r { x: u32 }\n"
+            "  variant v { a, b(u32) }\n"
+            "  enum e { on, off }\n"
+            "  flags f { r, w }\n"
+            "  resource h { get: func() -> u32; }\n"
+            "}\n")
+    (wit-ts-mode)
+    (should-not (treesit-query-capture
+                 (treesit-buffer-root-node) '((ERROR) @e) nil nil t))
+    (let ((captured (delete-dups
+                     (mapcar #'treesit-node-type
+                             (treesit-query-capture
+                              (treesit-buffer-root-node)
+                              '((typedef_item) @t) nil nil t)))))
+      (should (equal (sort captured #'string<)
+                     (sort (copy-sequence wit-ts-mode--typedef-item-types)
+                           #'string<))))))
+
 ;;; Font-lock
 
 (ert-deftest wit-ts-mode-fontifies-keywords-and-types ()
@@ -290,6 +333,32 @@ declarations that follow it."
     (goto-char (point-min))
     (search-forward "type after")
     (should-not (get-char-property (line-beginning-position) 'invisible))))
+
+(ert-deftest wit-ts-mode-outline-fold-does-not-swallow-world-members ()
+  "Collapsing a block in a world body leaves later `use'/`include' visible.
+Regression test: every member of the grammar's `world_definition'
+supertype has to be an outline heading (see
+`wit-ts-mode--world-definition-types'), otherwise the fold above a
+single-line `use' or `include' swallows it."
+  (skip-unless (treesit-ready-p 'wit t))
+  (require 'outline)
+  (with-temp-buffer
+    (insert "package a:b;\n"
+            "world w {\n"
+            "  record r {\n    id: u64,\n  }\n"
+            "  use types.{point};\n"
+            "  include other;\n"
+            "}\n")
+    (wit-ts-mode)
+    (outline-minor-mode 1)
+    (goto-char (point-min))
+    (search-forward "record r")
+    (beginning-of-line)
+    (outline-hide-subtree)
+    (dolist (needle '("use types" "include other"))
+      (goto-char (point-min))
+      (search-forward needle)
+      (should-not (get-char-property (line-beginning-position) 'invisible)))))
 
 (ert-deftest wit-ts-mode-outline-single-line-item-is-heading ()
   "A single-line declaration is recognized as its own outline heading.
@@ -790,6 +859,26 @@ field, variant case, enum case, flags field, or resource method
     ;; The `@unstable(feature = ...)' feature id.
     (should (eq (wit-ts-mode-tests--face-at "experimental")
                 'font-lock-string-face))))
+
+(ert-deftest wit-ts-mode-every-gate-keyword-fontifies ()
+  "Each member of the grammar's `gate_item' supertype is fontified.
+A supertype query pattern cannot carry children, so the three
+gates are matched by one font-lock pattern each; every one of them
+needs covering."
+  (skip-unless (treesit-ready-p 'wit t))
+  (dolist (gate '(("@since(version = 0.2.0)" . "since")
+                  ("@unstable(feature = x)" . "unstable")
+                  ("@deprecated(version = 0.3.0)" . "deprecated")))
+    (with-temp-buffer
+      (insert "package a:b;\n" (car gate)
+              "\ninterface i {\n  type t = u32;\n}\n")
+      (wit-ts-mode)
+      (font-lock-ensure)
+      (should (eq (wit-ts-mode-tests--face-at (cdr gate))
+                  'font-lock-builtin-face))
+      ;; The `@' introducing the gate (the first one in the buffer).
+      (should (eq (wit-ts-mode-tests--face-at "@")
+                  'font-lock-preprocessor-face)))))
 
 ;;; use names list (`use PATH.{ ... }')
 
